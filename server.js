@@ -70,12 +70,21 @@ async function updatePingTime(chatId) {
         return sendTelegramMessage(chatId, `Привет! Свет включен.`);
     }
 
+    // Отладочное логирование
+    logger.info(`DEBUG: light_state = "${row.light_state}", type = ${typeof row.light_state}`);
+
     // Парсим время (поддерживаем оба формата)
     const lightStartTime = parseDateTime(row.light_start_time);
     const previousDuration = now.diff(lightStartTime);
     
-    // Конвертируем light_state в boolean (из Google Sheets приходит строка)
-    const isLightOn = row.light_state === true || row.light_state === 'true';
+    // Конвертируем light_state в boolean (из Google Sheets может прийти: true, "true", "TRUE", 1, "1")
+    const isLightOn = row.light_state === true || 
+                      row.light_state === 'true' || 
+                      row.light_state === 'TRUE' ||
+                      row.light_state === 1 ||
+                      row.light_state === '1';
+    
+    logger.info(`DEBUG: isLightOn = ${isLightOn}`);
 
     if (isLightOn) {  // Если свет уже включен
         await saveLightState(chatId, now, true, lightStartTime, null);
@@ -98,7 +107,11 @@ app.get('/check-lights', async (req, res) => {
             const lastPingTime = parseDateTime(row.last_ping_time);
             
             // Конвертируем light_state в boolean
-            const isLightOn = row.light_state === true || row.light_state === 'true';
+            const isLightOn = row.light_state === true || 
+                              row.light_state === 'true' || 
+                              row.light_state === 'TRUE' ||
+                              row.light_state === 1 ||
+                              row.light_state === '1';
             
             if (now.diff(lastPingTime).as('seconds') > 180 && isLightOn) {
                 const lightStartTime = parseDateTime(row.light_start_time);
@@ -151,7 +164,11 @@ bot.onText(/\/status/, async (msg) => {
     }
 
     // Конвертируем light_state в boolean
-    const isLightOn = row.light_state === true || row.light_state === 'true';
+    const isLightOn = row.light_state === true || 
+                      row.light_state === 'true' || 
+                      row.light_state === 'TRUE' ||
+                      row.light_state === 1 ||
+                      row.light_state === '1';
     const lightState = isLightOn ? 'включен' : 'выключен';
     // Парсим время (поддерживаем оба формата)
     const durationCurrent = DateTime.now().diff(parseDateTime(row.light_start_time));
