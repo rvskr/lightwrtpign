@@ -102,6 +102,13 @@ app.get('/ping', (req, res) => {
     res.send("Ping received!");
 });
 
+// Дополнительный endpoint для устройств без SSL (небезопасный, но работает)
+app.get('/p', (req, res) => {
+    const chatId = req.query.c || req.query.chat_id || 'нет chat_id';
+    updatePingTime(chatId);
+    res.send("OK");
+});
+
 // Webhook endpoint для Telegram
 app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
     bot.processUpdate(req.body);

@@ -12,7 +12,13 @@ class SheetsDB {
     async initialize() {
         try {
             // Создаем клиента из JSON credentials
-            const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+            // Обрабатываем случай когда JSON может быть многострочным
+            let credentialsStr = process.env.GOOGLE_CREDENTIALS;
+            
+            // Если это не JSON объект, а строка - парсим
+            const credentials = typeof credentialsStr === 'string' 
+                ? JSON.parse(credentialsStr) 
+                : credentialsStr;
             
             const auth = new google.auth.GoogleAuth({
                 credentials: credentials,
