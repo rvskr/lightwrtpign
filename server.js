@@ -3,7 +3,7 @@ const dotenv = require('dotenv');
 const { DateTime } = require('luxon');
 const winston = require('winston');
 const TelegramBot = require('node-telegram-bot-api');
-const { createClient } = require('@supabase/supabase-js');
+const { Sequelize, DataTypes } = require('sequelize');
 
 dotenv.config();
 
@@ -12,7 +12,8 @@ app.use(express.json());
 app.use(express.static('public'));
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // https://your-app.onrender.com
+const bot = new TelegramBot(TELEGRAM_TOKEN);
 
 const logger = winston.createLogger({
     level: 'info',
@@ -26,7 +27,46 @@ const logger = winston.createLogger({
     ],
 });
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// Подключение к PostgreSQL
+const sequelize = new Sequelize(process.env.DATABASE_URL, {
+    dialect: 'postgres',
+    protocol: 'postgres',
+    dialectOptions: {
+        ssl: {
+            require: true,
+            rejectUnauthorized: false
+        }
+    },
+    logging: false
+});
+
+// Модель для хранения состояния света
+const LightState = sequelize.define('LightState', {
+    chat_id: {
+        type: DataTypes.STRING,
+        primaryKey: true,
+        allowNull: false
+    },
+    last_ping_time: {
+        type: DataTypes.DATE,
+        allowNull: false
+    },
+    light_state: {
+        type: DataTypes.BOOLEAN,
+        allowNull: false
+    },
+    light_start_time: {
+        type: DataTypes.DATE,
+        allowNull: false
+    },
+    previous_duration: {
+        type: DataTypes.STRING,
+        allowNull: true
+    }
+}, {
+    tableName: 'light_states',
+    timestamps: false
+});
 
 function sendTelegramMessage(chatId, message) {
     return bot.sendMessage(chatId, message)
@@ -35,35 +75,30 @@ function sendTelegramMessage(chatId, message) {
 }
 
 async function saveLightState(chatId, lastPingTime, lightState, lightStartTime, previousDuration) {
-    const { error } = await supabase
-        .from('light_states')
-        .upsert({
+    try {
+        await LightState.upsert({
             chat_id: chatId,
-            last_ping_time: lastPingTime.toISO(),
+            last_ping_time: lastPingTime.toJSDate(),
             light_state: lightState,
-            light_start_time: lightStartTime.toISO(),
+            light_start_time: lightStartTime.toJSDate(),
             previous_duration: previousDuration ? previousDuration.toFormat("hh:mm:ss") : null
         });
-
-    if (error) {
-        logger.error(`Ошибка сохранения данных в базу: ${error.message}`);
-    } else {
         logger.info(`Данные для chat_id ${chatId} сохранены в базу`);
+    } catch (error) {
+        logger.error(`Ошибка сохранения данных в базу: ${error.message}`);
     }
 }
 
 async function getLightState(chatId) {
-    const { data, error } = await supabase
-        .from('light_states')
-        .select('*')
-        .eq('chat_id', chatId)
-        .single();
-
-    if (error) {
+    try {
+        const data = await LightState.findOne({
+            where: { chat_id: chatId }
+        });
+        return data ? data.toJSON() : null;
+    } catch (error) {
         logger.error(`Ошибка чтения данных из базы: ${error.message}`);
         return null;
     }
-    return data;
 }
 
 async function updatePingTime(chatId) {
@@ -87,31 +122,30 @@ async function updatePingTime(chatId) {
     }
 }
 
-const lightCheckInterval = 30000; // Период проверки в миллисекундах
+// Endpoint для периодической проверки состояния (вызывается внешним cron)
+app.get('/check-lights', async (req, res) => {
+    try {
+        const now = DateTime.now();
+        const rows = await LightState.findAll();
 
-setInterval(async () => {
-    const now = DateTime.now();
-    const { data: rows, error } = await supabase
-        .from('light_states')
-        .select('*');
-
-    if (error) {
-        logger.error(`Ошибка чтения данных из базы: ${error.message}`);
-        return;
-    }
-
-    for (const row of rows) {
-        const chatId = row.chat_id;
-        const lastPingTime = DateTime.fromISO(row.last_ping_time);
-        
-        if (now.diff(lastPingTime).as('seconds') > 180 && row.light_state) {  // Если свет включен
-            const lightStartTime = DateTime.fromISO(row.light_start_time);
-            const previousDuration = now.diff(lightStartTime);
-            await saveLightState(chatId, now, false, now, previousDuration);
-            await sendTelegramMessage(chatId, `Свет ВЫКЛЮЧИЛИ. Был включен на протяжении ${previousDuration.toFormat('hh:mm:ss')}.`);
+        for (const row of rows) {
+            const chatId = row.chat_id;
+            const lastPingTime = DateTime.fromJSDate(new Date(row.last_ping_time));
+            
+            if (now.diff(lastPingTime).as('seconds') > 180 && row.light_state) {
+                const lightStartTime = DateTime.fromJSDate(new Date(row.light_start_time));
+                const previousDuration = now.diff(lightStartTime);
+                await saveLightState(chatId, now, false, now, previousDuration);
+                await sendTelegramMessage(chatId, `Свет ВЫКЛЮЧИЛИ. Был включен на протяжении ${previousDuration.toFormat('hh:mm:ss')}.`);
+            }
         }
+        
+        res.json({ status: 'ok', checked: rows.length });
+    } catch (error) {
+        logger.error(`Ошибка проверки состояния: ${error.message}`);
+        res.status(500).json({ error: error.message });
     }
-}, lightCheckInterval);
+});
 
 app.post('/ping', (req, res) => {
     const chatId = req.body.chat_id || 'нет chat_id';
@@ -125,6 +159,13 @@ app.get('/ping', (req, res) => {
     res.send("Ping received!");
 });
 
+// Webhook endpoint для Telegram
+app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
+    bot.processUpdate(req.body);
+    res.sendStatus(200);
+});
+
+// Обработчик команды /status
 bot.onText(/\/status/, async (msg) => {
     const chatId = msg.chat.id;
     logger.info(`Команда /status получена от группы с chat_id ${chatId}`);
@@ -135,7 +176,7 @@ bot.onText(/\/status/, async (msg) => {
     }
 
     const lightState = row.light_state ? 'включен' : 'выключен';
-    const durationCurrent = DateTime.now().diff(DateTime.fromISO(row.light_start_time));
+    const durationCurrent = DateTime.now().diff(DateTime.fromJSDate(new Date(row.light_start_time)));
     const previousDuration = row.previous_duration || 'неизвестно';
     const responseMessage = `Свет ${lightState} на протяжении ${durationCurrent.toFormat('hh:mm:ss')}. Предыдущий статус длился ${previousDuration}.`;
 
@@ -144,7 +185,25 @@ bot.onText(/\/status/, async (msg) => {
 });
 
 const PORT = process.env.PORT || 5002;
-app.listen(PORT, () => {
-    logger.info(`Сервер запущен на порту ${PORT}`);
-    sendTelegramMessage('558625598', `Привет! Бот запущен и готов к работе`);
+
+// Инициализация базы данных и запуск сервера
+sequelize.sync().then(async () => {
+    logger.info('База данных подключена');
+    
+    // Установка webhook для Telegram
+    if (WEBHOOK_URL) {
+        try {
+            await bot.setWebHook(`${WEBHOOK_URL}/bot${TELEGRAM_TOKEN}`);
+            logger.info(`Webhook установлен: ${WEBHOOK_URL}/bot${TELEGRAM_TOKEN}`);
+        } catch (error) {
+            logger.error(`Ошибка установки webhook: ${error.message}`);
+        }
+    }
+    
+    app.listen(PORT, () => {
+        logger.info(`Сервер запущен на порту ${PORT}`);
+        sendTelegramMessage('558625598', `Привет! Бот запущен и готов к работе`);
+    });
+}).catch(error => {
+    logger.error(`Ошибка подключения к базе данных: ${error.message}`);
 });
