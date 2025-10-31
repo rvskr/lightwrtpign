@@ -54,11 +54,16 @@ async function updatePingTime(chatId) {
         return sendTelegramMessage(chatId, `Привет! Свет включен.`);
     }
 
-    const lightStartTime = DateTime.fromISO(row.light_start_time);
+    // Парсим время из формата "dd.MM.yyyy HH:mm:ss"
+    const lightStartTime = DateTime.fromFormat(row.light_start_time, 'dd.MM.yyyy HH:mm:ss');
     const previousDuration = now.diff(lightStartTime);
+    
+    // Конвертируем light_state в boolean (из Google Sheets приходит строка)
+    const isLightOn = row.light_state === true || row.light_state === 'true';
 
-    if (row.light_state) {  // Если свет уже включен
+    if (isLightOn) {  // Если свет уже включен
         await saveLightState(chatId, now, true, lightStartTime, null);
+        logger.info(`Свет уже включен, обновлен last_ping_time`);
     } else {  // Если свет выключен
         await saveLightState(chatId, now, true, now, previousDuration);
         await sendTelegramMessage(chatId, `Свет ВКЛЮЧИЛИ. Был выключен на протяжении ${previousDuration.toFormat('hh:mm:ss')}.`);
@@ -73,10 +78,14 @@ app.get('/check-lights', async (req, res) => {
 
         for (const row of rows) {
             const chatId = row.chat_id;
-            const lastPingTime = DateTime.fromISO(row.last_ping_time);
+            // Парсим время из формата "dd.MM.yyyy HH:mm:ss"
+            const lastPingTime = DateTime.fromFormat(row.last_ping_time, 'dd.MM.yyyy HH:mm:ss');
             
-            if (now.diff(lastPingTime).as('seconds') > 180 && row.light_state) {
-                const lightStartTime = DateTime.fromISO(row.light_start_time);
+            // Конвертируем light_state в boolean
+            const isLightOn = row.light_state === true || row.light_state === 'true';
+            
+            if (now.diff(lastPingTime).as('seconds') > 180 && isLightOn) {
+                const lightStartTime = DateTime.fromFormat(row.light_start_time, 'dd.MM.yyyy HH:mm:ss');
                 const previousDuration = now.diff(lightStartTime);
                 await saveLightState(chatId, now, false, now, previousDuration);
                 await sendTelegramMessage(chatId, `Свет ВЫКЛЮЧИЛИ. Был включен на протяжении ${previousDuration.toFormat('hh:mm:ss')}.`);
@@ -125,8 +134,11 @@ bot.onText(/\/status/, async (msg) => {
         return bot.sendMessage(chatId, `Данных для chat_id ${chatId} не найдено.`);
     }
 
-    const lightState = row.light_state ? 'включен' : 'выключен';
-    const durationCurrent = DateTime.now().diff(DateTime.fromISO(row.light_start_time));
+    // Конвертируем light_state в boolean
+    const isLightOn = row.light_state === true || row.light_state === 'true';
+    const lightState = isLightOn ? 'включен' : 'выключен';
+    // Парсим время из формата "dd.MM.yyyy HH:mm:ss"
+    const durationCurrent = DateTime.now().diff(DateTime.fromFormat(row.light_start_time, 'dd.MM.yyyy HH:mm:ss'));
     const previousDuration = row.previous_duration || 'неизвестно';
     const responseMessage = `Свет ${lightState} на протяжении ${durationCurrent.toFormat('hh:mm:ss')}. Предыдущий статус длился ${previousDuration}.`;
 

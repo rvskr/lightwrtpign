@@ -82,11 +82,12 @@ class SheetsDB {
     async saveLightState(chatId, lastPingTime, lightState, lightStartTime, previousDuration) {
         try {
             const row = await this.findRowByChatId(chatId);
+            // Форматируем время в читаемый вид: "01.11.2025 02:44:01"
             const values = [[
                 chatId,
-                lastPingTime.toISO(),
+                lastPingTime.toFormat('dd.MM.yyyy HH:mm:ss'),
                 lightState,
-                lightStartTime.toISO(),
+                lightStartTime.toFormat('dd.MM.yyyy HH:mm:ss'),
                 previousDuration ? previousDuration.toFormat("hh:mm:ss") : ''
             ]];
 
@@ -136,9 +137,9 @@ class SheetsDB {
 
             return {
                 chat_id: dataRow[0],
-                last_ping_time: dataRow[1],
+                last_ping_time: dataRow[1], // Уже в читаемом формате
                 light_state: dataRow[2] === 'true',
-                light_start_time: dataRow[3],
+                light_start_time: dataRow[3], // Уже в читаемом формате
                 previous_duration: dataRow[4] || null
             };
         } catch (error) {
@@ -162,9 +163,9 @@ class SheetsDB {
             // Преобразуем все строки (кроме заголовка) в объекты
             return rows.slice(1).map(row => ({
                 chat_id: row[0],
-                last_ping_time: row[1],
+                last_ping_time: row[1], // Уже в читаемом формате
                 light_state: row[2] === 'true',
-                light_start_time: row[3],
+                light_start_time: row[3], // Уже в читаемом формате
                 previous_duration: row[4] || null
             }));
         } catch (error) {
