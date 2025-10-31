@@ -86,7 +86,7 @@ class SheetsDB {
             const values = [[
                 chatId,
                 lastPingTime.toFormat('dd.MM.yyyy HH:mm:ss'),
-                lightState,
+                lightState ? 'TRUE' : 'FALSE', // Сохраняем как строку
                 lightStartTime.toFormat('dd.MM.yyyy HH:mm:ss'),
                 previousDuration ? previousDuration.toFormat("hh:mm:ss") : ''
             ]];
@@ -138,7 +138,7 @@ class SheetsDB {
             return {
                 chat_id: dataRow[0],
                 last_ping_time: dataRow[1], // Уже в читаемом формате
-                light_state: dataRow[2] === 'true',
+                light_state: dataRow[2] === 'TRUE' || dataRow[2] === 'true' || dataRow[2] === true,
                 light_start_time: dataRow[3], // Уже в читаемом формате
                 previous_duration: dataRow[4] || null
             };
@@ -164,7 +164,7 @@ class SheetsDB {
             return rows.slice(1).map(row => ({
                 chat_id: row[0],
                 last_ping_time: row[1], // Уже в читаемом формате
-                light_state: row[2] === 'true',
+                light_state: row[2] === 'TRUE' || row[2] === 'true' || row[2] === true,
                 light_start_time: row[3], // Уже в читаемом формате
                 previous_duration: row[4] || null
             }));
