@@ -11,13 +11,7 @@ services:
         sync: false
       - key: WEBHOOK_URL
         sync: false
-      - key: DATABASE_URL
-        fromDatabase:
-          name: light-monitor-db
-          property: connectionString
-
-databases:
-  - name: light-monitor-db
-    databaseName: light_monitor
-    user: light_monitor_user
-    plan: free
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: GOOGLE_CREDENTIALS
+        sync: false

@@ -4,8 +4,13 @@
 /node_modules
 package-lock.json
 server copy.js
+server-local.js
 logs.log
 light_states.db
 lua copy
 lua
 lua
+credentials.json
+DEPLOY.md
+GOOGLE_SHEETS_SETUP.md
+render.yaml
