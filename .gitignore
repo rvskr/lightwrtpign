@@ -11,6 +11,6 @@ lua copy
 lua
 lua
 credentials.json
-DEPLOY.md
-GOOGLE_SHEETS_SETUP.md
-render.yaml
+credentials-oneline.txt
+convert-credentials.ps1
+/app
