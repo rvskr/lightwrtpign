@@ -77,6 +77,10 @@ class SheetsDB {
         delete allStatesCache['all'];
     }
 
+    clearCache(chatId) {
+        delete lightStateCache[chatId];
+    }
+
     getCached(chatId) {
         const cached = lightStateCache[chatId];
         if (cached && (Date.now() - cached.timestamp) < CACHE_TTL_MS) {
