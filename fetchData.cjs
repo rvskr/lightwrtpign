@@ -1,6 +1,15 @@
 const axios = require('axios');
 
+const cache = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут
+
 const fetchData = async (city, street, houseNumber) => {
+  const key = `${city}-${street}-${houseNumber}`;
+  const cached = cache.get(key);
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL_MS) {
+    return cached.data;
+  }
+
   const url = 'https://www.dtek-oem.com.ua/ua/ajax';
   const data = new URLSearchParams({
     'method': 'getHomeNum',
@@ -37,11 +46,14 @@ const fetchData = async (city, street, houseNumber) => {
     const { result, data: responseData, updateTimestamp } = response.data;
 
     if (result) {
-      return {
+      const resultData = {
         data: responseData,
         updateTimestamp
       };
+      cache.set(key, { data: resultData, timestamp: Date.now() });
+      return resultData;
     } else {
+      cache.set(key, { data: null, timestamp: Date.now() });
       return null;
     }
   } catch (error) {
