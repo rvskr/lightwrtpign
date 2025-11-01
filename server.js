@@ -4,7 +4,7 @@ const { DateTime } = require('luxon');
 const winston = require('winston');
 const TelegramBot = require('node-telegram-bot-api');
 const SheetsDB = require('./sheets');
-const fetchData = require('./app/fetchData.cjs');
+const fetchData = require('./fetchData.cjs');
 const data = require('./data.js');
 const Fuse = require('fuse.js');
 
