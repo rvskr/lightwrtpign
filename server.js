@@ -146,7 +146,8 @@ async function updatePingTime(chatId) {
     
     if (!row) {
         await db.saveLightState(chatId, now, true, now, null);
-        updatePinnedMessage(chatId);
+        const newRow = await db.getLightState(chatId);
+        updatePinnedMessage(chatId, getCurrentStatusMessage(newRow));
         return bot.sendMessage(chatId, '💡 Свет ВКЛЮЧЕН');
     }
     
@@ -161,7 +162,8 @@ async function updatePingTime(chatId) {
     
     if (row.light_state) {
         await db.saveLightState(chatId, now, true, lightStartTime, null);
-        updatePinnedMessage(chatId);
+        const newRow = await db.getLightState(chatId);
+        updatePinnedMessage(chatId, getCurrentStatusMessage(newRow));
         logger.info(`Свет включен, обновлен last_ping_time для ${chatId}`);
     } else {
         const offDuration = now.diff(lightStartTime);
