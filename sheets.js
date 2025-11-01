@@ -64,10 +64,10 @@ class SheetsDB {
                 // Добавляем заголовки
                 await this.sheets.spreadsheets.values.update({
                     spreadsheetId: this.spreadsheetId,
-                    range: `${this.sheetName}!A1:E1`,
-                    valueInputOption: 'RAW',
+                    range: `${this.sheetName}!A1:I1`,
+                    valueInputOption: 'USER_ENTERED',
                     resource: {
-                        values: [['chat_id', 'last_ping_time', 'light_state', 'light_start_time', 'previous_duration']]
+                        values: [['chat_id', 'last_ping_time', 'light_state', 'light_start_time', 'previous_duration', 'pinned_message_id', 'city', 'street', 'house_number']]
                     }
                 });
 
@@ -82,29 +82,39 @@ class SheetsDB {
     async saveLightState(chatId, lastPingTime, lightState, lightStartTime, previousDuration) {
         try {
             const row = await this.findRowByChatId(chatId);
-            // Форматируем время в читаемый вид: "01.11.2025 02:44:01"
+            // Читаем текущее значение pinned_message_id и адреса
+            const currentRow = await this.getLightState(chatId);
+            const pinnedMessageId = currentRow?.pinned_message_id || '';
+            const city = currentRow?.city || '';
+            const street = currentRow?.street || '';
+            const houseNumber = currentRow?.house_number || '';
+            
             const values = [[
                 chatId,
-                lastPingTime.toFormat('dd.MM.yyyy HH:mm:ss'),
-                lightState ? 'TRUE' : 'FALSE', // Сохраняем как строку
-                lightStartTime.toFormat('dd.MM.yyyy HH:mm:ss'),
-                previousDuration ? previousDuration.toFormat("hh:mm:ss") : ''
+                `'${lastPingTime.toFormat('dd.MM.yyyy HH:mm:ss')}`,
+                lightState ? 'TRUE' : 'FALSE',
+                `'${lightStartTime.toFormat('dd.MM.yyyy HH:mm:ss')}`,
+                previousDuration ? previousDuration.toFormat("hh:mm:ss") : '',
+                pinnedMessageId,
+                city,
+                street,
+                houseNumber
             ]];
 
             if (row) {
                 // Обновляем существующую строку
                 await this.sheets.spreadsheets.values.update({
                     spreadsheetId: this.spreadsheetId,
-                    range: `${this.sheetName}!A${row}:E${row}`,
-                    valueInputOption: 'RAW',
+                    range: `${this.sheetName}!A${row}:I${row}`,
+                    valueInputOption: 'USER_ENTERED',
                     resource: { values }
                 });
             } else {
                 // Добавляем новую строку
                 await this.sheets.spreadsheets.values.append({
                     spreadsheetId: this.spreadsheetId,
-                    range: `${this.sheetName}!A:E`,
-                    valueInputOption: 'RAW',
+                    range: `${this.sheetName}!A:I`,
+                    valueInputOption: 'USER_ENTERED',
                     resource: { values }
                 });
             }
@@ -120,7 +130,7 @@ class SheetsDB {
         try {
             const response = await this.sheets.spreadsheets.values.get({
                 spreadsheetId: this.spreadsheetId,
-                range: `${this.sheetName}!A:E`,
+                range: `${this.sheetName}!A:I`,
             });
 
             const rows = response.data.values;
@@ -129,7 +139,7 @@ class SheetsDB {
             }
 
             // Ищем строку с нужным chat_id (пропускаем заголовок)
-            const dataRow = rows.slice(1).find(row => row[0] === chatId);
+            const dataRow = rows.slice(1).find(row => row[0] === String(chatId));
             
             if (!dataRow) {
                 return null;
@@ -137,10 +147,14 @@ class SheetsDB {
 
             return {
                 chat_id: dataRow[0],
-                last_ping_time: dataRow[1], // Уже в читаемом формате
+                last_ping_time: dataRow[1],
                 light_state: dataRow[2] === 'TRUE' || dataRow[2] === 'true' || dataRow[2] === true,
-                light_start_time: dataRow[3], // Уже в читаемом формате
-                previous_duration: dataRow[4] || null
+                light_start_time: dataRow[3],
+                previous_duration: dataRow[4] || null,
+                pinned_message_id: dataRow[5] || null,
+                city: dataRow[6] || '',
+                street: dataRow[7] || '',
+                house_number: dataRow[8] || ''
             };
         } catch (error) {
             this.logger.error(`Ошибка чтения из Google Sheets: ${error.message}`);
@@ -152,7 +166,7 @@ class SheetsDB {
         try {
             const response = await this.sheets.spreadsheets.values.get({
                 spreadsheetId: this.spreadsheetId,
-                range: `${this.sheetName}!A:E`,
+                range: `${this.sheetName}!A:I`,
             });
 
             const rows = response.data.values;
@@ -163,10 +177,14 @@ class SheetsDB {
             // Преобразуем все строки (кроме заголовка) в объекты
             return rows.slice(1).map(row => ({
                 chat_id: row[0],
-                last_ping_time: row[1], // Уже в читаемом формате
+                last_ping_time: row[1],
                 light_state: row[2] === 'TRUE' || row[2] === 'true' || row[2] === true,
-                light_start_time: row[3], // Уже в читаемом формате
-                previous_duration: row[4] || null
+                light_start_time: row[3],
+                previous_duration: row[4] || null,
+                pinned_message_id: row[5] || null,
+                city: row[6] || '',
+                street: row[7] || '',
+                house_number: row[8] || ''
             }));
         } catch (error) {
             this.logger.error(`Ошибка чтения всех данных из Google Sheets: ${error.message}`);
@@ -187,11 +205,70 @@ class SheetsDB {
             }
 
             // Ищем индекс строки (учитываем что первая строка - заголовок)
-            const rowIndex = rows.findIndex((row, index) => index > 0 && row[0] === chatId);
-            return rowIndex > 0 ? rowIndex + 1 : null;
+            const rowIndex = rows.findIndex((row, index) => index > 0 && row[0] === String(chatId));
+            return rowIndex >= 0 ? rowIndex + 1 : null;
         } catch (error) {
             this.logger.error(`Ошибка поиска строки: ${error.message}`);
             return null;
+        }
+    }
+
+    async saveAddress(chatId, city, street, houseNumber) {
+        try {
+            const row = await this.findRowByChatId(chatId);
+            console.log(`Найденная строка для ${chatId}: ${row}`);
+            if (row) {
+                // Обновляем существующую строку
+                await this.sheets.spreadsheets.values.update({
+                    spreadsheetId: this.spreadsheetId,
+                    range: `${this.sheetName}!G${row}:I${row}`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values: [[city, street, houseNumber]] }
+                });
+                this.logger.info(`Адрес для chat_id ${chatId} сохранен`);
+            } else {
+                // Создаем новую строку с адресом
+                const { DateTime } = require('luxon');
+                const now = DateTime.now();
+                const values = [[
+                    chatId,
+                    `'${now.toFormat('dd.MM.yyyy HH:mm:ss')}`,
+                    'TRUE', // Предполагаем свет включен
+                    `'${now.toFormat('dd.MM.yyyy HH:mm:ss')}`,
+                    '', // previous_duration
+                    '', // pinned_message_id
+                    city,
+                    street,
+                    houseNumber
+                ]];
+                await this.sheets.spreadsheets.values.append({
+                    spreadsheetId: this.spreadsheetId,
+                    range: `${this.sheetName}!A:I`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values }
+                });
+                this.logger.info(`Новая строка с адресом для chat_id ${chatId} создана`);
+            }
+        } catch (error) {
+            this.logger.error(`Ошибка сохранения адреса: ${error.message}`);
+        }
+    }
+
+    async savePinnedMessageId(chatId, pinnedMessageId) {
+        try {
+            const row = await this.findRowByChatId(chatId);
+            if (row) {
+                // Обновляем существующую строку
+                await this.sheets.spreadsheets.values.update({
+                    spreadsheetId: this.spreadsheetId,
+                    range: `${this.sheetName}!F${row}`,
+                    valueInputOption: 'USER_ENTERED',
+                    resource: { values: [[pinnedMessageId]] }
+                });
+                this.logger.info(`Pinned message ID для chat_id ${chatId} сохранен`);
+            }
+        } catch (error) {
+            this.logger.error(`Ошибка сохранения pinned message ID: ${error.message}`);
         }
     }
 }
