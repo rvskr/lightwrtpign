@@ -177,9 +177,36 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
     res.sendStatus(200);
 });
 
+bot.onText(/\/start(?:@\w+)?/, async (msg) => {
+    const chatId = msg.chat.id;
+    console.log(`Команда /start от ${chatId} в чате типа ${msg.chat.type}`);
+    
+    if (!checkRateLimit(chatId)) {
+        return; // Rate limited, silently ignore
+    }
+    
+    const welcomeMessage = `🚀 Добро пожаловать в бот мониторинга света!
+
+📋 Доступные команды:
+/start - Показать это сообщение
+/status - Показать статус света
+/address - Настроить адрес для мониторинга отключений
+/dtek - Проверить информацию об отключениях по вашему адресу
+
+💡 Бот автоматически отслеживает состояние света и уведомляет об изменениях.
+⚡ Для получения информации об отключениях используйте /dtek после настройки адреса.`;
+
+    bot.sendMessage(chatId, welcomeMessage);
+    logger.info(`Приветственное сообщение отправлено для ${chatId}`);
+});
+
 bot.onText(/\/status(?:@\w+)?/, async (msg) => {
     const chatId = msg.chat.id;
     console.log(`Команда /status от ${chatId} в чате типа ${msg.chat.type}`);
+    
+    if (!checkRateLimit(chatId)) {
+        return; // Rate limited, silently ignore
+    }
     const row = await db.getLightState(chatId);
     if (!row) {
         return bot.sendMessage(chatId, `❌ Нет данных для chat_id ${chatId}`);
@@ -196,6 +223,10 @@ bot.onText(/\/status(?:@\w+)?/, async (msg) => {
 bot.onText(/\/address(?:@\w+)?/, async (msg) => {
     const chatId = msg.chat.id;
     console.log(`Команда /address от ${chatId} в чате типа ${msg.chat.type}`);
+    
+    if (!checkRateLimit(chatId)) {
+        return; // Rate limited, silently ignore
+    }
     userSessions[chatId] = { step: 'city' };
     bot.sendMessage(chatId, 'Пожалуйста, введите название города.');
 });
@@ -203,6 +234,10 @@ bot.onText(/\/address(?:@\w+)?/, async (msg) => {
 bot.onText(/\/dtek(?:@\w+)?/, async (msg) => {
     const chatId = msg.chat.id;
     console.log(`Команда /dtek от ${chatId} в чате типа ${msg.chat.type}`);
+    
+    if (!checkRateLimit(chatId)) {
+        return; // Rate limited, silently ignore
+    }
     const message = await getDtekInfo(chatId);
     bot.sendMessage(chatId, message);
 });
@@ -213,7 +248,7 @@ bot.on('message', async (msg) => {
     console.log(`Сообщение: "${text}" от ${chatId} в чате типа ${msg.chat.type}`);
 
     // Пропускаем команды
-    if (text && (/^\/status(?:@\w+)?/.test(text) || /^\/address(?:@\w+)?/.test(text) || /^\/dtek(?:@\w+)?/.test(text))) {
+    if (text && (/^\/start(?:@\w+)?/.test(text) || /^\/status(?:@\w+)?/.test(text) || /^\/address(?:@\w+)?/.test(text) || /^\/dtek(?:@\w+)?/.test(text))) {
         return;
     }
 
@@ -324,6 +359,22 @@ bot.on('callback_query', async (query) => {
 
 const userSessions = {};
 const previousStates = {};
+const userRateLimits = {}; // Store last request timestamps for rate limiting
+
+// Rate limiting: minimum 2 seconds between requests per user
+const RATE_LIMIT_MS = 2000;
+
+function checkRateLimit(chatId) {
+    const now = Date.now();
+    const lastRequest = userRateLimits[chatId];
+    
+    if (lastRequest && (now - lastRequest) < RATE_LIMIT_MS) {
+        return false; // Rate limited
+    }
+    
+    userRateLimits[chatId] = now;
+    return true; // OK to proceed
+}
 
 const PORT = process.env.PORT || 5002;
 

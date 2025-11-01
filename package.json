@@ -4,8 +4,7 @@
   "description": "Telegram bot for monitoring electricity status",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server-local.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "axios": "^1.7.2",
@@ -15,7 +14,6 @@
     "googleapis": "^140.0.0",
     "luxon": "^3.4.4",
     "node-telegram-bot-api": "^0.66.0",
-    "puppeteer": "^24.27.0",
     "winston": "^3.13.1"
   },
   "engines": {
