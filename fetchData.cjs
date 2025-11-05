@@ -1,4 +1,6 @@
 const axios = require('axios');
+const { DateTime, Settings } = require('luxon');
+Settings.defaultZone = 'Europe/Kyiv';
 
 const cache = new Map();
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут
@@ -36,9 +38,8 @@ const fetchData = async (city, street, houseNumber) => {
   });
 
   try {
-    const two = n => n.toString().padStart(2, '0');
-    const now = new Date();
-    const updateFact = `${two(now.getDate())}.${two(now.getMonth() + 1)}.${now.getFullYear()} ${two(now.getHours())}:${two(now.getMinutes())}`;
+    const now = DateTime.now();
+    const updateFact = now.toFormat('dd.MM.yyyy HH:mm');
     
     let response = await axios.post('https://www.dtek-oem.com.ua/ua/ajax', makeParams(updateFact).toString(), { headers });
     let { result, data: responseData, updateTimestamp, showCurOutageParam, preset } = response.data || {};

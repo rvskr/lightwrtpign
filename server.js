@@ -1,6 +1,6 @@
 const express = require('express');
 const dotenv = require('dotenv');
-const { DateTime } = require('luxon');
+const { DateTime, Settings } = require('luxon');
 const winston = require('winston');
 const TelegramBot = require('node-telegram-bot-api');
 const pLimit = require('p-limit');
@@ -10,6 +10,8 @@ const data = require('./data.js');
 const Fuse = require('fuse.js');
 
 dotenv.config();
+
+Settings.defaultZone = 'Europe/Kyiv';
 
 const app = express();
 app.use(express.json());
@@ -495,10 +497,13 @@ bot.onText(/\/status(?:@\w+)?/, async (msg) => {
     }
     
     if (!hasDeviceConnected(row, { strict: true })) {
-        const addressText = row.house_number?.trim() 
-            ? `${row.city}, ${row.street}, ${row.house_number}` 
-            : `${row.city}, ${row.street} (вся улица)`;
-        return bot.sendMessage(chatId, `📍 ${addressText}\n\n💡 /dtek для информации\n🔌 Подключите устройство`);
+        const dtekMsg = await getDtekInfo(chatId, true);
+        invalidateUserCache(chatId);
+        const updated = await getUserFromCache(chatId);
+        if (updated) {
+            return bot.sendMessage(chatId, `${formatMessage(updated)}\n\n📊 DTEK:\n${dtekMsg}`);
+        }
+        return bot.sendMessage(chatId, `📊 DTEK:\n${dtekMsg}`);
     }
     
     bot.sendMessage(chatId, formatMessage(row));
