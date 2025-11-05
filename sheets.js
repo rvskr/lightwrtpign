@@ -1,11 +1,9 @@
 const { google } = require('googleapis');
 const { DateTime } = require('luxon');
 
-// Cache
-const lightStateCache = {};
-const CACHE_TTL_MS = 30000;
-const allStatesCache = {};
-const ALL_STATES_CACHE_TTL_MS = 30000;
+// Unified cache
+const cache = {};
+const CACHE_TTL = 30000;
 
 class SheetsDB {
     constructor(logger) {
@@ -73,42 +71,13 @@ class SheetsDB {
         }
     }
 
-    clearAllCache() {
-        delete allStatesCache['all'];
-    }
-
-    clearCache(chatId) {
-        delete lightStateCache[chatId];
-    }
-
-    getCached(chatId) {
-        const cached = lightStateCache[chatId];
-        if (cached && (Date.now() - cached.timestamp) < CACHE_TTL_MS) {
-            return cached.data;
+    cache(key, data) {
+        if (data === undefined) {
+            const cached = cache[key];
+            return (cached && Date.now() - cached.t < CACHE_TTL) ? cached.d : null;
         }
-        return null;
-    }
-
-    setCache(chatId, data) {
-        lightStateCache[chatId] = {
-            data: data,
-            timestamp: Date.now()
-        };
-    }
-
-    getAllCached() {
-        const cached = allStatesCache['all'];
-        if (cached && (Date.now() - cached.timestamp) < ALL_STATES_CACHE_TTL_MS) {
-            return cached.data;
-        }
-        return null;
-    }
-
-    setAllCache(data) {
-        allStatesCache['all'] = {
-            data: data,
-            timestamp: Date.now()
-        };
+        if (data === null) delete cache[key];
+        else cache[key] = { d: data, t: Date.now() };
     }
 
     async findRowByChatId(chatId) {
@@ -130,66 +99,64 @@ class SheetsDB {
     }
 
     parseRow(row) {
+        const toBool = v => v === 'TRUE' || v === 'true' || v === true;
         return {
             chat_id: row[0],
             last_ping_time: row[1] || '',
-            light_state: row[2] && (row[2] === 'TRUE' || row[2] === 'true' || row[2] === true),
+            light_state: toBool(row[2]),
             light_start_time: row[3] || '',
             previous_duration: row[4] || '',
             pinned_message_id: row[5] || '',
             city: row[6] || '',
             street: row[7] || '',
             house_number: row[8] || '',
-            ignored: row[9] && (row[9] === 'TRUE' || row[9] === 'true' || row[9] === true),
-            mode: row[10] || 'full'
+            ignored: toBool(row[9]),
+            mode: row[10] || 'full',
+            first_name: row[11] || '',
+            last_name: row[12] || '',
+            username: row[13] || '',
+            user_link: row[14] || ''
         };
     }
 
     async saveLightState(chatId, lastPingTime, lightState, lightStartTime, previousDuration) {
         try {
-            this.clearCache(chatId);
-            this.clearAllCache();
+            this.cache(chatId, null);
+            this.cache('all', null);
             const row = await this.findRowByChatId(chatId);
+            const fmt = dt => `'${dt.toFormat('dd.MM.yyyy HH:mm:ss')}`;
+            const values = [[
+                fmt(lastPingTime),
+                lightState ? 'TRUE' : 'FALSE',
+                fmt(lightStartTime),
+                previousDuration ? previousDuration.toFormat('hh:mm:ss') : ''
+            ]];
             
             if (!row) {
-                const values = [[
-                    chatId,
-                    `'${lastPingTime.toFormat('dd.MM.yyyy HH:mm:ss')}`,
-                    lightState ? 'TRUE' : 'FALSE',
-                    `'${lightStartTime.toFormat('dd.MM.yyyy HH:mm:ss')}`,
-                    previousDuration ? previousDuration.toFormat('hh:mm:ss') : '',
-                    '', '', '', ''
-                ]];
                 await this.sheets.spreadsheets.values.append({
                     spreadsheetId: this.spreadsheetId,
                     range: `${this.sheetName}!A:I`,
                     valueInputOption: 'USER_ENTERED',
-                    resource: { values }
+                    resource: { values: [[chatId, ...values[0], '', '', '', '']] }
                 });
             } else {
                 await this.sheets.spreadsheets.values.update({
                     spreadsheetId: this.spreadsheetId,
                     range: `${this.sheetName}!B${row}:E${row}`,
                     valueInputOption: 'USER_ENTERED',
-                    resource: { values: [[
-                        `'${lastPingTime.toFormat('dd.MM.yyyy HH:mm:ss')}`,
-                        lightState ? 'TRUE' : 'FALSE',
-                        `'${lightStartTime.toFormat('dd.MM.yyyy HH:mm:ss')}`,
-                        previousDuration ? previousDuration.toFormat('hh:mm:ss') : ''
-                    ]] }
+                    resource: { values }
                 });
             }
-
-            this.logger.info(`Данные для chat_id ${chatId} сохранены в Google Sheets`);
+            this.logger.info(`Данные для chat_id ${chatId} сохранены`);
         } catch (error) {
-            this.logger.error(`Ошибка сохранения в Google Sheets: ${error.message}`);
+            this.logger.error(`Ошибка сохранения: ${error.message}`);
             throw error;
         }
     }
 
     async getLightState(chatId) {
         try {
-            const cached = this.getCached(chatId);
+            const cached = this.cache(chatId);
             if (cached !== null) return cached;
 
             const response = await this.sheets.spreadsheets.values.get({
@@ -198,29 +165,19 @@ class SheetsDB {
             });
 
             const rows = response.data.values;
-            if (!rows || rows.length <= 1) {
-                this.setCache(chatId, null);
-                return null;
-            }
-
-            const dataRow = rows.slice(1).find(row => row[0] === String(chatId));
-            if (!dataRow) {
-                this.setCache(chatId, null);
-                return null;
-            }
-
-            const result = this.parseRow(dataRow);
-            this.setCache(chatId, result);
+            const dataRow = rows?.slice(1).find(row => row[0] === String(chatId));
+            const result = dataRow ? this.parseRow(dataRow) : null;
+            this.cache(chatId, result);
             return result;
         } catch (error) {
-            this.logger.error(`Ошибка получения состояния света: ${error.message}`);
+            this.logger.error(`Ошибка получения состояния: ${error.message}`);
             return null;
         }
     }
 
     async getAllLightStates() {
         try {
-            const cached = this.getAllCached();
+            const cached = this.cache('all');
             if (cached !== null) return cached;
 
             const response = await this.sheets.spreadsheets.values.get({
@@ -229,24 +186,19 @@ class SheetsDB {
             });
 
             const rows = response.data.values;
-            if (!rows || rows.length <= 1) {
-                this.setAllCache([]);
-                return [];
-            }
-
-            const result = rows.slice(1).map(row => this.parseRow(row));
-            this.setAllCache(result);
+            const result = rows?.slice(1).map(row => this.parseRow(row)) || [];
+            this.cache('all', result);
             return result;
         } catch (error) {
-            this.logger.error(`Ошибка чтения всех данных из Google Sheets: ${error.message}`);
+            this.logger.error(`Ошибка чтения всех данных: ${error.message}`);
             return [];
         }
     }
 
     async saveAddress(chatId, city, street, houseNumber, mode = 'full') {
         try {
-            this.clearCache(chatId);
-            this.clearAllCache();
+            this.cache(chatId, null);
+            this.cache('all', null);
             const row = await this.findRowByChatId(chatId);
             
             if (row) {
@@ -256,24 +208,17 @@ class SheetsDB {
                     valueInputOption: 'USER_ENTERED',
                     resource: { values: [[city, street, houseNumber, 'FALSE', mode]] }
                 });
-                this.logger.info(`Адрес для chat_id ${chatId} сохранен`);
             } else {
                 const now = DateTime.now();
-                const values = [[
-                    chatId,
-                    `'${now.toFormat('dd.MM.yyyy HH:mm:ss')}`,
-                    'FALSE',
-                    `'${now.toFormat('dd.MM.yyyy HH:mm:ss')}`,
-                    '', '', city, street, houseNumber, 'FALSE', mode
-                ]];
+                const fmt = `'${now.toFormat('dd.MM.yyyy HH:mm:ss')}`;
                 await this.sheets.spreadsheets.values.append({
                     spreadsheetId: this.spreadsheetId,
                     range: `${this.sheetName}!A:K`,
                     valueInputOption: 'USER_ENTERED',
-                    resource: { values }
+                    resource: { values: [[chatId, fmt, 'FALSE', fmt, '', '', city, street, houseNumber, 'FALSE', mode]] }
                 });
-                this.logger.info(`Новая строка с адресом для chat_id ${chatId} создана`);
             }
+            this.logger.info(`Адрес для ${chatId} сохранен`);
         } catch (error) {
             this.logger.error(`Ошибка сохранения адреса: ${error.message}`);
         }
@@ -281,38 +226,30 @@ class SheetsDB {
 
     async initializeUser(chatId) {
         try {
-            const existingRow = await this.findRowByChatId(chatId);
-            if (existingRow) return true;
-
-            const values = [[
-                chatId, '', '', '', '', '', '', '', '', 'FALSE', ''
-            ]];
+            if (await this.findRowByChatId(chatId)) return true;
 
             await this.sheets.spreadsheets.values.append({
                 spreadsheetId: this.spreadsheetId,
                 range: `${this.sheetName}!A:K`,
                 valueInputOption: 'USER_ENTERED',
-                resource: { values }
+                resource: { values: [[chatId, '', '', '', '', '', '', '', '', 'FALSE', '']] }
             });
 
-            this.clearAllCache();
-            this.logger.info(`Пользователь ${chatId} инициализирован в таблице`);
+            this.cache('all', null);
+            this.logger.info(`Пользователь ${chatId} инициализирован`);
             return true;
         } catch (error) {
-            this.logger.error(`Ошибка инициализации пользователя ${chatId}: ${error.message}`);
+            this.logger.error(`Ошибка инициализации ${chatId}: ${error.message}`);
             return false;
         }
     }
 
     async updateField(chatId, column, value) {
         try {
-            this.clearCache(chatId);
-            this.clearAllCache();
+            this.cache(chatId, null);
+            this.cache('all', null);
             const row = await this.findRowByChatId(chatId);
-            if (!row) {
-                this.logger.error(`Пользователь ${chatId} не найден для обновления поля`);
-                return false;
-            }
+            if (!row) return false;
 
             await this.sheets.spreadsheets.values.update({
                 spreadsheetId: this.spreadsheetId,
@@ -320,40 +257,56 @@ class SheetsDB {
                 valueInputOption: 'USER_ENTERED',
                 resource: { values: [[value]] }
             });
-
             return true;
         } catch (error) {
-            this.logger.error(`Ошибка обновления поля: ${error.message}`);
+            this.logger.error(`Ошибка обновления: ${error.message}`);
             return false;
         }
     }
 
     async setIgnored(chatId, ignored) {
-        const result = await this.updateField(chatId, 'J', ignored ? 'TRUE' : 'FALSE');
-        if (result) this.logger.info(`Статус ignored для chat_id ${chatId} установлен в ${ignored}`);
-        return result;
+        return this.updateField(chatId, 'J', ignored ? 'TRUE' : 'FALSE');
+    }
+
+    async saveUserInfo(chatId, userInfo) {
+        try {
+            this.cache(chatId, null);
+            this.cache('all', null);
+            const row = await this.findRowByChatId(chatId);
+            if (!row) return false;
+
+            const { first_name = '', last_name = '', username = '' } = userInfo;
+            const user_link = username ? `https://t.me/${username}` : '';
+
+            await this.sheets.spreadsheets.values.update({
+                spreadsheetId: this.spreadsheetId,
+                range: `${this.sheetName}!L${row}:O${row}`,
+                valueInputOption: 'USER_ENTERED',
+                resource: { values: [[first_name, last_name, username, user_link]] }
+            });
+            
+            this.logger.info(`Информация о пользователе ${chatId} сохранена`);
+            return true;
+        } catch (error) {
+            this.logger.error(`Ошибка сохранения информации о пользователе: ${error.message}`);
+            return false;
+        }
     }
 
     async getIgnored(chatId) {
-        const row = await this.getLightState(chatId);
-        return row?.ignored || false;
+        return (await this.getLightState(chatId))?.ignored || false;
     }
 
     async savePinnedMessageId(chatId, messageId) {
-        const result = await this.updateField(chatId, 'F', messageId);
-        if (result) this.logger.info(`Pinned message ID ${messageId} сохранен для chat_id ${chatId}`);
-        return result;
+        return this.updateField(chatId, 'F', messageId);
     }
 
     async setMode(chatId, mode) {
-        const result = await this.updateField(chatId, 'K', mode);
-        if (result) this.logger.info(`Режим ${mode} установлен для chat_id ${chatId}`);
-        return result;
+        return this.updateField(chatId, 'K', mode);
     }
 
     async getMode(chatId) {
-        const row = await this.getLightState(chatId);
-        return row?.mode || null;
+        return (await this.getLightState(chatId))?.mode || null;
     }
 }
 

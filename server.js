@@ -3,6 +3,7 @@ const dotenv = require('dotenv');
 const { DateTime } = require('luxon');
 const winston = require('winston');
 const TelegramBot = require('node-telegram-bot-api');
+const pLimit = require('p-limit');
 const SheetsDB = require('./sheets');
 const fetchData = require('./fetchData.cjs');
 const data = require('./data.js');
@@ -27,211 +28,396 @@ const logger = winston.createLogger({
     transports: [new winston.transports.Console()],
 });
 
+// Константы
+const RATE_LIMIT_MS = 1000;
+const PING_TIMEOUT_SEC = 180;
+const LIGHTS_CHECK_INTERVAL_MS = 60_000;
+const DTEK_CHECK_MINUTES = 15;
+const PARALLEL_LIMIT = 20; // Одновременных операций
+const TELEGRAM_LIMIT = 25; // Telegram: 30 msg/sec, оставляем запас
+
 const db = new SheetsDB(logger);
 const cities = Object.keys(data.streets);
 const fuseCities = new Fuse(cities, { threshold: 0.4 });
 const userSessions = {};
 const userRateLimits = {};
-const RATE_LIMIT_MS = 1000;
 
-// Утилиты
-function checkRateLimit(chatId) {
-    const now = Date.now();
-    const lastRequest = userRateLimits[chatId];
-    if (lastRequest && (now - lastRequest) < RATE_LIMIT_MS) return false;
-    userRateLimits[chatId] = now;
-    return true;
-}
+// Кеш для DTEK запросов (5 минут)
+const dtekCache = new Map();
+const DTEK_CACHE_TTL = 5 * 60 * 1000; // 5 минут
 
-function parseDateTime(timeString) {
-    if (!timeString?.trim()) return DateTime.now();
-    const cleanString = timeString.startsWith("'") ? timeString.substring(1) : timeString;
-    const formats = ['dd.MM.yyyy HH:mm:ss', 'dd.MM.yyyy H:mm:ss'];
-    
-    for (const fmt of formats) {
-        const dt = DateTime.fromFormat(cleanString, fmt);
-        if (dt.isValid) return dt;
+// Кеш пользователей (обновляется каждую минуту)
+let usersCache = new Map(); // chatId -> row
+let usersCacheTimestamp = 0;
+const USERS_CACHE_TTL = 60 * 1000; // 1 минута
+
+// Лимитеры для параллельной обработки
+const parallelLimit = pLimit(PARALLEL_LIMIT);
+const telegramLimit = pLimit(TELEGRAM_LIMIT);
+
+// Очередь Telegram сообщений с rate limiting
+class TelegramQueue {
+    constructor() {
+        this.queue = [];
+        this.processing = false;
     }
     
-    const dt = DateTime.fromISO(cleanString);
-    return dt.isValid ? dt : DateTime.now();
+    async add(fn) {
+        return new Promise((resolve, reject) => {
+            this.queue.push({ fn, resolve, reject });
+            this.process();
+        });
+    }
+    
+    async process() {
+        if (this.processing || this.queue.length === 0) return;
+        this.processing = true;
+        
+        while (this.queue.length > 0) {
+            const batch = this.queue.splice(0, TELEGRAM_LIMIT);
+            await Promise.all(batch.map(({ fn, resolve, reject }) => 
+                fn().then(resolve).catch(reject)
+            ));
+            if (this.queue.length > 0) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+        
+        this.processing = false;
+    }
 }
 
-async function shouldSkipChat(chatId) {
-    const row = await db.getLightState(chatId);
+const telegramQueue = new TelegramQueue();
+
+// Утилиты
+const checkRateLimit = (chatId) => {
+    const now = Date.now();
+    if (userRateLimits[chatId] && (now - userRateLimits[chatId]) < RATE_LIMIT_MS) return false;
+    userRateLimits[chatId] = now;
+    return true;
+};
+
+const parseDateTime = (timeString) => {
+    if (!timeString?.trim()) return DateTime.now();
+    const clean = timeString.startsWith("'") ? timeString.substring(1) : timeString;
+    for (const fmt of ['dd.MM.yyyy HH:mm:ss', 'dd.MM.yyyy H:mm:ss']) {
+        const dt = DateTime.fromFormat(clean, fmt);
+        if (dt.isValid) return dt;
+    }
+    const dt = DateTime.fromISO(clean);
+    return dt.isValid ? dt : DateTime.now();
+};
+
+// Обновление кеша пользователей
+const refreshUsersCache = async () => {
+    try {
+        const rows = await db.getAllLightStates();
+        usersCache.clear();
+        rows.forEach(row => usersCache.set(row.chat_id, row));
+        usersCacheTimestamp = Date.now();
+        logger.info(`Кеш пользователей обновлен: ${rows.length} пользователей`);
+    } catch (error) {
+        logger.error('Ошибка обновления кеша пользователей:', error);
+    }
+};
+
+// Получение пользователя из кеша (с автообновлением)
+const getUserFromCache = async (chatId) => {
+    // Если пользователя нет в кеше - загружаем из БД
+    if (!usersCache.has(chatId)) {
+        logger.info(`Кеш: пользователь ${chatId} не найден, загружаем из БД`);
+        const row = await db.getLightState(chatId);
+        if (row) {
+            usersCache.set(chatId, row);
+            return row;
+        }
+        return null;
+    }
+    
+    // Обновляем весь кеш если устарел
+    if (Date.now() - usersCacheTimestamp > USERS_CACHE_TTL) {
+        await refreshUsersCache();
+    }
+    
+    return usersCache.get(chatId);
+};
+
+// Обновление одного пользователя в кеше
+const updateUserInCache = (chatId, row) => {
+    usersCache.set(chatId, row);
+};
+
+// Инвалидация пользователя в кеше (принудительное обновление при следующем запросе)
+const invalidateUserCache = (chatId) => {
+    usersCache.delete(chatId);
+};
+
+const shouldSkipChat = async (chatId) => {
+    const row = await getUserFromCache(chatId);
     return row?.ignored || false;
+};
+
+const hasDeviceConnected = (row, { strict = false } = {}) => {
+    const hasTimes = row?.last_ping_time?.trim() && row?.light_start_time?.trim();
+    return hasTimes && (!strict || row.last_ping_time !== row.light_start_time);
+};
+
+const formatMessage = (row, short = false) => {
+    const duration = DateTime.now().diff(parseDateTime(row.light_start_time));
+    const icon = row.light_state ? '💡' : '🌑';
+    const state = row.light_state ? 'ВКЛЮЧЕН' : 'ВЫКЛЮЧЕН';
+    if (short) return `${icon} Свет ${state}\n⏱${duration.toFormat("d'd' h'ч' m'мин' s'с'")}`;  
+    return `${icon} Свет ${state}\n⏱ Текущий статус: ${duration.toFormat('hh:mm:ss')}\n📊 Предыдущий статус: ${row.previous_duration || 'неизвестно'}`;
+};
+
+// Унифицированная логика получения и суммирования данных DTEK
+async function fetchAndSummarizeDtek(city, street, house_number) {
+    try {
+        const addressText = house_number ? `${city}, ${street}, ${house_number}` : `${city}, ${street} (вся улица)`;
+        const cacheKey = `${city}|${street}|${house_number}`;
+        
+        // Проверяем кеш
+        const cached = dtekCache.get(cacheKey);
+        if (cached && (Date.now() - cached.timestamp < DTEK_CACHE_TTL)) {
+            logger.info(`DTEK: используем кеш для ${addressText}`);
+            return cached.data;
+        }
+        
+        const result = await fetchData(city, street, house_number);
+        
+        if (!result) {
+            return { inferredOff: false, message: `Не удалось получить данные для ${addressText}.` };
+        }
+
+        const { data, updateTimestamp, resolvedHomeKey, showCurOutageParam } = result;
+        const keyToUse = (resolvedHomeKey && data?.[resolvedHomeKey]) ? resolvedHomeKey : house_number;
+        const houseData = data[keyToUse] || {};
+
+        // Если нет прямого отключения по дому и глобальный флаг не активен — отключений нет
+        if (!houseData.sub_type && !showCurOutageParam) {
+            const resultData = { inferredOff: false, message: `По адресу ${addressText} отключений нет. Обновлено: ${updateTimestamp}`, updateTimestamp };
+            dtekCache.set(cacheKey, { data: resultData, timestamp: Date.now() });
+            return resultData;
+        }
+
+        // Флаг на уровне улицы активен, но по дому данных нет — суммаризируем по активным записям
+        if (!houseData.sub_type && showCurOutageParam) {
+            const all = Object.values(data || {});
+            const isActive = (x) => !!(x && ((x.sub_type && x.sub_type.trim()) || (x.start_date && x.start_date.trim()) || (x.end_date && x.end_date.trim())));
+            const activeEntries = all.filter(isActive);
+            if (activeEntries.length === 0) {
+                const resultData = { inferredOff: false, message: `По адресу ${addressText} отключений нет. Обновлено: ${updateTimestamp}`, updateTimestamp };
+                dtekCache.set(cacheKey, { data: resultData, timestamp: Date.now() });
+                return resultData;
+            }
+
+            const reasons = [...new Set(activeEntries.flatMap(x => Array.isArray(x?.sub_type_reason) ? x.sub_type_reason : []).filter(Boolean))];
+            const parseMaybe = (s) => {
+                if (!s || !s.trim()) return null;
+                const dt = DateTime.fromFormat(s.trim(), 'HH:mm dd.MM.yyyy');
+                return dt.isValid ? dt : null;
+            };
+            const starts = activeEntries.map(x => parseMaybe(x?.start_date)).filter(Boolean);
+            const ends = activeEntries.map(x => parseMaybe(x?.end_date)).filter(Boolean);
+            const minStart = starts.length ? starts.reduce((a,b) => a < b ? a : b) : null;
+            const maxEnd = ends.length ? ends.reduce((a,b) => a > b ? a : b) : null;
+            const startText = minStart ? minStart.toFormat('HH:mm dd.MM.yyyy') : 'Не указано';
+            const endText = maxEnd ? maxEnd.toFormat('HH:mm dd.MM.yyyy') : 'Не указано';
+
+            logger.info('DTEK: outage indicated by flag, summarizing active street entries', { city, street, house_number, reasons, startText, endText });
+            const resultData = {
+                inferredOff: true,
+                message: `Обновлено: ${updateTimestamp}\n\nАдрес: ${addressText}\nСтатус: Зафиксировано ограничение/отключение по улице\nПричины: ${reasons.length ? reasons.join(', ') : 'Не указано'}\nНачало: ${startText}\nОкончание: ${endText}`,
+                updateTimestamp
+            };
+            dtekCache.set(cacheKey, { data: resultData, timestamp: Date.now() });
+            return resultData;
+        }
+
+        // Прямое отключение по дому
+        logger.info('DTEK: outage detected', { city, street, house_number, sub_type: houseData.sub_type, start_date: houseData.start_date, end_date: houseData.end_date, sub_type_reason: houseData.sub_type_reason });
+        const resultData = {
+            inferredOff: true,
+            message: `Обновлено: ${updateTimestamp}\n\nАдрес: ${addressText}\nТип: ${houseData.sub_type || 'Не указано'}\nНачало: ${houseData.start_date || 'Не указано'}\nОкончание: ${houseData.end_date || 'Не указано'}\nТип причины: ${houseData.sub_type_reason?.join(', ') || 'Не указано'}`,
+            updateTimestamp
+        };
+        dtekCache.set(cacheKey, { data: resultData, timestamp: Date.now() });
+        return resultData;
+    } catch (error) {
+        logger.error('Ошибка получения данных DTEK:', error);
+        return { inferredOff: false, message: 'Ошибка при получении данных.' };
+    }
 }
 
 // Получение информации DTEK
-async function getDtekInfo(chatId) {
-    const row = await db.getLightState(chatId);
-    if (!row?.city || !row?.street || !row?.house_number) {
-        return 'Адрес не настроен. Используйте /address для настройки.';
-    }
+const getDtekInfo = async (chatId, updateState = false) => {
+    const row = await getUserFromCache(chatId);
+    if (!row?.city || !row?.street) return 'Адрес не настроен. Используйте /address.';
     
-    const { city, street, house_number } = row;
-    try {
-        const result = await fetchData(city, street, house_number);
-        if (!result) return `Не удалось получить данные для ${city}, ${street}, ${house_number}.`;
-        
-        const { data, updateTimestamp } = result;
-        const houseData = data[house_number] || {};
-        
-        if (!houseData.sub_type) {
-            return `По адресу ${city}, ${street}, ${house_number} отключений нет. Обновлено: ${updateTimestamp}`;
-        }
-        
-        return `Обновлено: ${updateTimestamp}\n\nАдрес: ${city}, ${street}, ${house_number}\nТип: ${houseData.sub_type || 'Не указано'}\nНачало: ${houseData.start_date || 'Не указано'}\nОкончание: ${houseData.end_date || 'Не указано'}\nТип причины: ${houseData.sub_type_reason?.join(', ') || 'Не указано'}`;
-    } catch (error) {
-        logger.error('Ошибка получения данных DTEK:', error);
-        return 'Ошибка при получении данных.';
-    }
-}
-
-// Обновление закрепленного сообщения
-async function updatePinnedMessage(chatId, message) {
-    if (await shouldSkipChat(chatId)) return;
+    // house_number может быть пустым (вся улица)
+    const houseNumber = row.house_number?.trim() || '';
+    const summary = await fetchAndSummarizeDtek(row.city, row.street, houseNumber);
     
-    const row = await db.getLightState(chatId);
-    const mode = row?.mode;
-    
-    if (mode === 'dtek_only') return; // В режиме dtek_only не используем pinned сообщения
-    
-    try {
-        if (!row) return;
-        
-        const messageToSend = message || getCurrentStatusMessage(row);
-        const pinnedMessageId = row.pinned_message_id;
-        
-        if (pinnedMessageId) {
-            try {
-                await bot.editMessageText(messageToSend, { chat_id: chatId, message_id: pinnedMessageId });
-            } catch (error) {
-                if (!error.message.includes('message is not modified')) throw error;
+    // Если устройство не подключено и запрошено обновление состояния
+    if (updateState && !hasDeviceConnected(row, { strict: true }) && summary.updateTimestamp) {
+        const dtekTime = DateTime.fromFormat(summary.updateTimestamp, 'HH:mm dd.MM.yyyy');
+        if (dtekTime.isValid) {
+            const newState = !summary.inferredOff; // Нет отключений = свет включен
+            
+            logger.info(`DTEK: обновляем состояние для ${chatId}, устройство не подключено, новое состояние: ${newState ? 'включен' : 'выключен'}, время: ${dtekTime.toFormat('HH:mm dd.MM.yyyy')}`);
+            
+            // Всегда обновляем состояние для пользователей без устройства
+            await db.saveLightState(chatId, dtekTime, newState, dtekTime, null);
+            
+            // Инвалидируем кеш
+            invalidateUserCache(chatId);
+            
+            // Создаем или обновляем закрепленное сообщение
+            const updatedRow = await getUserFromCache(chatId);
+            if (updatedRow) {
+                logger.info(`DTEK: вызываем updatePinnedMessage для ${chatId}`);
+                await updatePinnedMessage(chatId);
+            } else {
+                logger.error(`DTEK: не удалось получить обновленную строку для ${chatId}`);
             }
         } else {
-            const sentMsg = await bot.sendMessage(chatId, messageToSend);
-            await bot.pinChatMessage(chatId, sentMsg.message_id);
-            await db.savePinnedMessageId(chatId, sentMsg.message_id);
+            logger.error(`DTEK: неверный формат времени для ${chatId}: ${summary.updateTimestamp}`);
         }
-    } catch (error) {
-        logger.error(`Ошибка обновления закрепленного сообщения для ${chatId}: ${error.message}`);
+    } else {
+        logger.info(`DTEK: пропускаем обновление для ${chatId}, updateState=${updateState}, hasDevice=${hasDeviceConnected(row, { strict: true })}, hasTimestamp=${!!summary.updateTimestamp}`);
     }
-}
+    
+    return summary.message;
+};
 
-function getCurrentStatusMessage(row) {
-    const currentDuration = DateTime.now().diff(parseDateTime(row.light_start_time));
-    const icon = row.light_state ? '💡' : '🌑';
-    const state = row.light_state ? 'ВКЛЮЧЕН' : 'ВЫКЛЮЧЕН';
-    const duration = currentDuration.toFormat('d\'д\' h\'ч\' m\'мин\' s\'с\'');
-    return `${icon} Свет ${state}\n⏱${duration}`;
-}
+// Обновление закрепленного сообщения (с rate limiting)
+const updatePinnedMessage = async (chatId, message) => {
+    if (await shouldSkipChat(chatId)) return;
+    const row = await getUserFromCache(chatId);
+    if (!row) return;
+    
+    return telegramQueue.add(async () => {
+        try {
+            const msg = message || formatMessage(row, true);
+            if (row.pinned_message_id) {
+                try {
+                    await bot.editMessageText(msg, { chat_id: chatId, message_id: row.pinned_message_id });
+                } catch (e) {
+                    if (!e.message.includes('message is not modified')) throw e;
+                }
+            } else {
+                const sent = await bot.sendMessage(chatId, msg);
+                await bot.pinChatMessage(chatId, sent.message_id);
+                await db.savePinnedMessageId(chatId, sent.message_id);
+                invalidateUserCache(chatId);
+            }
+        } catch (error) {
+            logger.error(`Ошибка обновления закрепленного сообщения ${chatId}: ${error.message}`);
+        }
+    });
+};
 
-// Уведомления
-async function notifyStatusChange(chatId, statusMessage) {
+
+// Уведомления (с rate limiting)
+const notifyStatusChange = async (chatId, statusMessage) => {
     if (await shouldSkipChat(chatId)) return;
     updatePinnedMessage(chatId);
-    await bot.sendMessage(chatId, statusMessage)
-        .then(() => logger.info('Сообщение отправлено'))
-        .catch((error) => logger.error(`Ошибка отправки сообщения: ${error}`));
-}
+    await telegramQueue.add(() => bot.sendMessage(chatId, statusMessage));
+};
 
 // Обработка пинга
-async function updatePingTime(chatId) {
+const updatePingTime = async (chatId) => {
     if (await shouldSkipChat(chatId)) return;
-    
     const now = DateTime.now();
-    logger.info(`Получен пинг от ${chatId}`);
-    const row = await db.getLightState(chatId);
+    const row = await getUserFromCache(chatId);
     
     if (!row) {
         await db.saveLightState(chatId, now, true, now, null);
-        const newRow = await db.getLightState(chatId);
-        updatePinnedMessage(chatId, getCurrentStatusMessage(newRow));
+        invalidateUserCache(chatId);
+        updatePinnedMessage(chatId);
         return bot.sendMessage(chatId, '💡 Свет ВКЛЮЧЕН');
     }
     
-    // Переключение с dtek_only на full при первом пинге
-    if (row.mode === 'dtek_only') {
-        await db.setMode(chatId, 'full');
-        logger.info(`Режим переключен с dtek_only на full для ${chatId}`);
-        return bot.sendMessage(chatId, '🔄 Режим переключен на полноценный мониторинг\n💡 Свет ВКЛЮЧЕН');
-    }
-    
     const lightStartTime = parseDateTime(row.light_start_time);
-    
     if (row.light_state) {
         await db.saveLightState(chatId, now, true, lightStartTime, null);
-        const newRow = await db.getLightState(chatId);
-        updatePinnedMessage(chatId, getCurrentStatusMessage(newRow));
-        logger.info(`Свет включен, обновлен last_ping_time для ${chatId}`);
+        // Кеш обновится автоматически при следующем запросе
+        updatePinnedMessage(chatId);
     } else {
         const offDuration = now.diff(lightStartTime);
         await db.saveLightState(chatId, now, true, now, null);
+        invalidateUserCache(chatId);
         await notifyStatusChange(chatId, `💡 Свет ВКЛЮЧЕН\n⏸ Был выключен: ${offDuration.toFormat('hh:mm:ss')}`);
-        logger.info(`Свет включен для ${chatId} (был выключен ${offDuration.toFormat('hh:mm:ss')})`);
     }
-}
+};
 
-// Проверка DTEK-only режима
-async function checkDtekOnlyStatus() {
+// Единая проверка состояния света (оптимизировано для 1000+ пользователей)
+const checkLightsStatus = async () => {
     try {
+        const startTime = Date.now();
         const now = DateTime.now();
         const rows = await db.getAllLightStates();
         
-        for (const row of rows) {
-            if (row.mode !== 'dtek_only' || row.ignored || !row.city?.trim()) continue;
-            
-            const lastDtekCheck = row.last_ping_time ? parseDateTime(row.last_ping_time) : DateTime.now().minus({ minutes: 16 });
-            const minutesSinceLastCheck = now.diff(lastDtekCheck).as('minutes');
-            
-            if (minutesSinceLastCheck >= 15) {
-                await db.saveLightState(row.chat_id, now, false, now, null);
-                const dtekMessage = await getDtekInfo(row.chat_id);
-                await bot.sendMessage(row.chat_id, `📊 DTEK информация (автоматическая проверка):\n${dtekMessage}`)
-                    .catch((error) => logger.error(`Ошибка отправки DTEK: ${error}`));
-                logger.info(`DTEK проверка выполнена для ${row.chat_id} (режим dtek_only, прошло ${Math.round(minutesSinceLastCheck)} минут)`);
-            }
-        }
-    } catch (error) {
-        logger.error(`Ошибка DTEK проверки: ${error.message}`);
-    }
-}
-
-// Проверка состояния света
-async function checkLightsStatus() {
-    try {
-        const now = DateTime.now();
-        const rows = await db.getAllLightStates();
+        logger.info(`Начало проверки для ${rows.length} пользователей`);
         
-        for (const row of rows) {
-            if (row.ignored || !row.city?.trim() || row.mode !== 'full') continue;
+        // Параллельная обработка с лимитом
+        await Promise.all(rows.map(row => parallelLimit(async () => {
+            if (row.ignored || !row.city?.trim()) return;
             
-            const hasDeviceConnected = row.last_ping_time?.trim() && row.light_start_time?.trim();
-            if (!hasDeviceConnected) continue;
+            const hasDevice = hasDeviceConnected(row, { strict: true });
             
-            const lastPingTime = parseDateTime(row.last_ping_time);
-            const timeSinceLastPing = now.diff(lastPingTime).as('seconds');
-            
-            if (timeSinceLastPing > 180 && row.light_state) {
-                const lightStartTime = parseDateTime(row.light_start_time);
-                const onDuration = now.diff(lightStartTime);
-                await db.saveLightState(row.chat_id, now, false, now, onDuration);
-                await notifyStatusChange(row.chat_id, `🌑 Свет ВЫКЛЮЧЕН\n⏸ Был включен: ${onDuration.toFormat('hh:mm:ss')}`);
-                logger.info(`Свет выключен для ${row.chat_id} (нет пинга ${Math.round(timeSinceLastPing)}s)`);
+            // Режим с устройством: проверка таймаута пингов
+            if (hasDevice) {
+                const secs = now.diff(parseDateTime(row.last_ping_time)).as('seconds');
                 
-                const dtekMessage = await getDtekInfo(row.chat_id);
-                await bot.sendMessage(row.chat_id, dtekMessage)
-                    .catch((error) => logger.error(`Ошибка отправки DTEK: ${error}`));
-            } else {
-                await updatePinnedMessage(row.chat_id);
-                logger.info(`Мастер-сообщение обновлено для ${row.chat_id} (${row.light_state ? 'включен' : 'выключен'})`);
+                if (secs > PING_TIMEOUT_SEC && row.light_state) {
+                    const onDuration = now.diff(parseDateTime(row.light_start_time));
+                    await db.saveLightState(row.chat_id, now, false, now, onDuration);
+                    invalidateUserCache(row.chat_id);
+                    await notifyStatusChange(row.chat_id, `🌑 Свет ВЫКЛЮЧЕН\n⏸ Был включен: ${onDuration.toFormat('hh:mm:ss')}`);
+                    const dtekMsg = await getDtekInfo(row.chat_id);
+                    await telegramQueue.add(() => bot.sendMessage(row.chat_id, dtekMsg));
+                } else {
+                    await updatePinnedMessage(row.chat_id);
+                }
             }
-        }
+            // Режим только DTEK: проверка каждые 15 минут
+            else {
+                const lastCheck = row.last_ping_time ? parseDateTime(row.last_ping_time) : now.minus({ minutes: DTEK_CHECK_MINUTES + 1 });
+                const mins = now.diff(lastCheck).as('minutes');
+                
+                if (mins >= DTEK_CHECK_MINUTES) {
+                    const houseNumber = row.house_number?.trim() || '';
+                    const { inferredOff, message: msg } = await fetchAndSummarizeDtek(row.city, row.street, houseNumber);
+                    const startTime = parseDateTime(row.light_start_time);
+
+                    if (inferredOff && row.light_state) {
+                        await db.saveLightState(row.chat_id, now, false, now, now.diff(startTime));
+                        invalidateUserCache(row.chat_id);
+                        await notifyStatusChange(row.chat_id, '🌑 Свет ВЫКЛЮЧЕН');
+                    } else if (!inferredOff && !row.light_state) {
+                        await db.saveLightState(row.chat_id, now, true, now, null);
+                        invalidateUserCache(row.chat_id);
+                        await notifyStatusChange(row.chat_id, '💡 Свет ВКЛЮЧЕН');
+                    } else {
+                        await db.saveLightState(row.chat_id, now, row.light_state, startTime, null);
+                    }
+                    
+                    await updatePinnedMessage(row.chat_id);
+                    await telegramQueue.add(() => bot.sendMessage(row.chat_id, `📊 DTEK (авто):\n${msg}`));
+                } else {
+                    // Просто обновляем таймер в закрепленном сообщении
+                    await updatePinnedMessage(row.chat_id);
+                }
+            }
+        })));
+        
+        const duration = Date.now() - startTime;
+        logger.info(`Проверка завершена за ${duration}ms для ${rows.length} пользователей`);
     } catch (error) {
         logger.error(`Ошибка проверки: ${error.message}`);
     }
-}
+};
 
 // Маршруты
 app.get('/check-lights', async (req, res) => {
@@ -258,7 +444,6 @@ app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
 
 // Команды бота
 bot.onText(/\/start(?:@\w+)?/, async (msg) => {
-    const startTime = Date.now();
     const chatId = msg.chat.id;
     if (!checkRateLimit(chatId)) return;
     
@@ -266,22 +451,20 @@ bot.onText(/\/start(?:@\w+)?/, async (msg) => {
         await db.setIgnored(chatId, false);
         await db.initializeUser(chatId);
         
-        const welcomeMessage = `🚀 Добро пожаловать в бот мониторинга света!
-
-📋 Доступные команды:
-/start - Показать это сообщение
-/stop - Отключить бота для этого чата
-/status - Показать статус света
-/address - Настроить адрес для мониторинга отключений
-/dtek - Проверить информацию об отключениях по вашему адресу
-
-💡 Бот автоматически отслеживает состояние света и уведомляет об изменениях.
-⚡ Для получения информации об отключениях используйте /dtek после настройки адреса.`;
-
-        bot.sendMessage(chatId, welcomeMessage);
-        logger.info(`Приветственное сообщение отправлено для ${chatId} (время: ${Date.now() - startTime} ms)`);
+        // Сохранить информацию о пользователе
+        const user = msg.from;
+        await db.saveUserInfo(chatId, {
+            first_name: user.first_name,
+            last_name: user.last_name,
+            username: user.username
+        });
+        
+        invalidateUserCache(chatId);
+        
+        const userName = user.first_name || 'Пользователь';
+        bot.sendMessage(chatId, `👋 Привет, ${userName}!\n\n🚀 Бот мониторинга света\n\n📋 Команды:\n/start - Это сообщение\n/stop - Отключить бота\n/status - Статус света\n/address - Настроить адрес\n/dtek - Информация об отключениях\n\n💡 Бот отслеживает свет автоматически`);
     } catch (error) {
-        logger.error(`Ошибка в /start для ${chatId}: ${error.message}`);
+        logger.error(`/start ${chatId}: ${error.message}`);
     }
 });
 
@@ -291,78 +474,65 @@ bot.onText(/\/stop(?:@\w+)?/, async (msg) => {
     
     try {
         await db.setIgnored(chatId, true);
-        bot.sendMessage(chatId, '🚫 Бот отключен для этого чата. Все уведомления и команды будут игнорироваться.\n\nДля возобновления работы используйте /start');
-        logger.info(`Статус ignored для ${chatId} установлен`);
+        invalidateUserCache(chatId);
+        bot.sendMessage(chatId, '🚫 Бот отключен. Для возобновления /start');
     } catch (error) {
-        logger.error(`Ошибка в /stop для ${chatId}: ${error.message}`);
-        bot.sendMessage(chatId, '❌ Произошла ошибка при отключении бота.');
+        logger.error(`/stop ${chatId}: ${error.message}`);
+        bot.sendMessage(chatId, '❌ Ошибка');
     }
 });
 
 bot.onText(/\/status(?:@\w+)?/, async (msg) => {
-    const startTime = Date.now();
     const chatId = msg.chat.id;
-    if (!checkRateLimit(chatId) || await shouldSkipChat(chatId)) return;
+    if (!checkRateLimit(chatId)) return;
     
-    const row = await db.getLightState(chatId);
-    if (!row) {
-        return bot.sendMessage(chatId, '❌ Произошла ошибка. Попробуйте /start для переинициализации.');
+    const row = await getUserFromCache(chatId);
+    if (!row) return bot.sendMessage(chatId, '❌ Ошибка. Попробуйте /start.');
+    if (row.ignored) return;
+    
+    if (!row.city?.trim()) {
+        return bot.sendMessage(chatId, '📍 Адрес не настроен\n\n💡 Используйте /address\n🔌 Подключите устройство для пингов');
     }
     
-    const hasAddress = row.city?.trim();
-    const mode = row.mode;
-    
-    // Адрес не настроен
-    if (!hasAddress) {
-        return bot.sendMessage(chatId, '📍 Адрес не настроен\n\n💡 Для получения информации об отключениях используйте /address для настройки адреса\n🔌 Для автоматического отслеживания подключите устройство для отправки пингов');
+    if (!hasDeviceConnected(row, { strict: true })) {
+        const addressText = row.house_number?.trim() 
+            ? `${row.city}, ${row.street}, ${row.house_number}` 
+            : `${row.city}, ${row.street} (вся улица)`;
+        return bot.sendMessage(chatId, `📍 ${addressText}\n\n💡 /dtek для информации\n🔌 Подключите устройство`);
     }
     
-    // DTEK-only режим
-    if (mode === 'dtek_only') {
-        const hasDeviceConnected = row.last_ping_time?.trim() && row.light_start_time?.trim();
-        const dtekMessage = await getDtekInfo(chatId);
-        
-        if (!hasDeviceConnected) {
-            return bot.sendMessage(chatId, `📊 Режим: Только DTEK (ожидание устройства)\n🏠 ${row.city}, ${row.street}, ${row.house_number}\n\n⏳ Ожидание подключения устройства для полноценного мониторинга\n\n${dtekMessage}`);
-        } else {
-            return bot.sendMessage(chatId, `📊 Режим: Только DTEK\n🏠 ${row.city}, ${row.street}, ${row.house_number}\n\n${dtekMessage}`);
-        }
-    }
-    
-    // Полноценный режим без подключенного устройства
-    const hasDeviceConnected = row.last_ping_time?.trim() && row.light_start_time?.trim() && row.last_ping_time !== row.light_start_time;
-    if (!hasDeviceConnected) {
-        return bot.sendMessage(chatId, `📍 Адрес настроен для мониторинга\n🏠 ${row.city}, ${row.street}, ${row.house_number}\n\n💡 Можете использовать /dtek для получения информации об отключениях\n🔌 Для автоматического отслеживания подключите устройство для отправки пингов`);
-    }
-    
-    // Полноценный режим с подключенным устройством
-    const lightStartTime = parseDateTime(row.light_start_time);
-    const currentDuration = DateTime.now().diff(lightStartTime);
-    const icon = row.light_state ? '💡' : '🌑';
-    const state = row.light_state ? 'ВКЛЮЧЕН' : 'ВЫКЛЮЧЕН';
-    const prevDuration = row.previous_duration || 'неизвестно';
-    const message = `${icon} Свет ${state}\n⏱ Текущий статус: ${currentDuration.toFormat('hh:mm:ss')}\n📊 Предыдущий статус: ${prevDuration}`;
-    
-    bot.sendMessage(chatId, message);
-    logger.info(`Статус отправлен для ${chatId} (время: ${Date.now() - startTime} ms)`);
+    bot.sendMessage(chatId, formatMessage(row));
 });
 
 bot.onText(/\/address(?:@\w+)?/, async (msg) => {
     const chatId = msg.chat.id;
-    if (!checkRateLimit(chatId) || await shouldSkipChat(chatId)) return;
+    if (!checkRateLimit(chatId)) return;
+    
+    const row = await getUserFromCache(chatId);
+    if (row?.ignored) return;
     
     userSessions[chatId] = { step: 'city' };
-    bot.sendMessage(chatId, 'Пожалуйста, введите название города.');
+    
+    // Кнопки с популярными городами из data.js
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: 'м. Одеса', callback_data: 'city_м. Одеса' }],
+            [{ text: 'м. Чорноморськ', callback_data: 'city_м. Чорноморськ' }],
+            [{ text: 'м. Ізмаїл', callback_data: 'city_м. Ізмаїл' }]
+        ]
+    };
+    
+    bot.sendMessage(chatId, '🏙 Выберите или введите город:', { reply_markup: keyboard });
 });
 
 bot.onText(/\/dtek(?:@\w+)?/, async (msg) => {
-    const startTime = Date.now();
     const chatId = msg.chat.id;
-    if (await shouldSkipChat(chatId) || !checkRateLimit(chatId)) return;
+    if (!checkRateLimit(chatId)) return;
     
-    const message = await getDtekInfo(chatId);
-    bot.sendMessage(chatId, message);
-    logger.info(`DTEK информация отправлена для ${chatId} (время: ${Date.now() - startTime} ms)`);
+    const row = await getUserFromCache(chatId);
+    if (row?.ignored) return;
+    
+    bot.sendMessage(chatId, await getDtekInfo(chatId, true));
 });
 
 // Обработка сообщений для сессий
@@ -370,7 +540,7 @@ bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
     
-    if (await shouldSkipChat(chatId)) return;
+    // Пропускаем команды
     if (text && /^\/(start|stop|status|address|dtek)(?:@\w+)?/.test(text)) return;
     
     if (userSessions[chatId]) {
@@ -380,62 +550,93 @@ bot.on('message', async (msg) => {
             switch (session.step) {
                 case 'city':
                     if (!text?.trim()) {
-                        return bot.sendMessage(chatId, 'Ошибка: название города не может быть пустым.');
+                        return bot.sendMessage(chatId, '❌ Название города не может быть пустым. Попробуйте еще раз:');
                     }
                     
-                    if (!data.streets[text]) {
-                        const results = fuseCities.search(text);
-                        if (results.length > 0) {
-                            const suggestions = results.slice(0, 5);
-                            session.citySuggestions = suggestions;
-                            const keyboard = {
-                                inline_keyboard: suggestions.map((r, i) => [{ text: r.item, callback_data: `select_city_${i}` }])
-                            };
-                            return bot.sendMessage(chatId, 'Город не найден. Выберите вариант:', { reply_markup: keyboard });
-                        } else {
-                            return bot.sendMessage(chatId, 'Город не найден. Введите точное название города из списка DTEK.');
-                        }
+                    // Точное совпадение
+                    if (data.streets[text]) {
+                        session.city = text;
+                        session.step = 'street';
+                        return bot.sendMessage(chatId, `✅ Город: ${text}\n\n🏠 Введите название улицы:`);
                     }
                     
-                    session.city = text;
-                    session.step = 'street';
-                    bot.sendMessage(chatId, 'Введите название улицы.');
-                    break;
+                    // Поиск похожих
+                    const results = fuseCities.search(text);
+                    
+                    if (results.length === 0) {
+                        return bot.sendMessage(chatId, `❌ Город "${text}" не найден.\n\n💡 Проверьте правильность написания или выберите из списка:\nhttps://www.dtek-oem.com.ua/ua/shutdowns\n\nВведите другой город:`);
+                    }
+                    
+                    // Автовыбор при 1 совпадении
+                    if (results.length === 1) {
+                        session.city = results[0].item;
+                        session.step = 'street';
+                        return bot.sendMessage(chatId, `✅ Город: ${results[0].item}\n\n🏠 Введите название улицы:`);
+                    }
+                    
+                    // Несколько вариантов
+                    const suggestions = results.slice(0, 5);
+                    session.citySuggestions = suggestions;
+                    const keyboard = {
+                        inline_keyboard: suggestions.map((r, i) => [{ text: r.item, callback_data: `select_city_${i}` }])
+                    };
+                    return bot.sendMessage(chatId, '🔍 Найдено несколько вариантов. Выберите:', { reply_markup: keyboard });
                     
                 case 'street':
                     if (!text?.trim()) {
-                        return bot.sendMessage(chatId, 'Ошибка: название улицы не может быть пустым.');
+                        return bot.sendMessage(chatId, '❌ Название улицы не может быть пустым. Попробуйте еще раз:');
                     }
                     
-                    if (!data.streets[session.city].includes(text)) {
-                        const fuseStreets = new Fuse(data.streets[session.city], { threshold: 0.4 });
-                        const results = fuseStreets.search(text);
-                        if (results.length > 0) {
-                            const suggestions = results.slice(0, 5);
-                            session.streetSuggestions = suggestions;
-                            const keyboard = {
-                                inline_keyboard: suggestions.map((r, i) => [{ text: r.item, callback_data: `select_street_${i}` }])
-                            };
-                            return bot.sendMessage(chatId, 'Улица не найдена. Выберите вариант:', { reply_markup: keyboard });
-                        } else {
-                            return bot.sendMessage(chatId, 'Улица не найдена. Введите точное название улицы из списка DTEK.');
-                        }
+                    const streets = data.streets[session.city];
+                    
+                    // Точное совпадение
+                    if (streets.includes(text)) {
+                        session.street = text;
+                        session.step = 'houseNumber';
+                        const keyboard = {
+                            inline_keyboard: [[{ text: '⏭ Пропустить (вся улица)', callback_data: 'skip_house' }]]
+                        };
+                        return bot.sendMessage(chatId, `✅ Улица: ${text}\n\n🏘 Введите номер дома или пропустите для всей улицы:`, { reply_markup: keyboard });
                     }
                     
-                    session.street = text;
-                    session.step = 'houseNumber';
-                    bot.sendMessage(chatId, 'Введите номер дома.');
-                    break;
+                    // Поиск похожих
+                    const fuseStreets = new Fuse(streets, { threshold: 0.4 });
+                    const streetResults = fuseStreets.search(text);
+                    
+                    if (streetResults.length === 0) {
+                        return bot.sendMessage(chatId, `❌ Улица "${text}" не найдена в городе ${session.city}.\n\n💡 Проверьте правильность написания или выберите из списка:\nhttps://www.dtek-oem.com.ua/ua/shutdowns\n\nВведите другую улицу:`);
+                    }
+                    
+                    // Автовыбор при 1 совпадении
+                    if (streetResults.length === 1) {
+                        session.street = streetResults[0].item;
+                        session.step = 'houseNumber';
+                        const keyboard = {
+                            inline_keyboard: [[{ text: '⏭ Пропустить (вся улица)', callback_data: 'skip_house' }]]
+                        };
+                        return bot.sendMessage(chatId, `✅ Улица: ${streetResults[0].item}\n\n🏘 Введите номер дома или пропустите для всей улицы:`, { reply_markup: keyboard });
+                    }
+                    
+                    // Несколько вариантов
+                    const streetSuggestions = streetResults.slice(0, 5);
+                    session.streetSuggestions = streetSuggestions;
+                    const streetKeyboard = {
+                        inline_keyboard: streetSuggestions.map((r, i) => [{ text: r.item, callback_data: `select_street_${i}` }])
+                    };
+                    return bot.sendMessage(chatId, '🔍 Найдено несколько вариантов. Выберите:', { reply_markup: streetKeyboard });
                     
                 case 'houseNumber':
-                    if (!text?.trim()) {
-                        return bot.sendMessage(chatId, 'Ошибка: номер дома не может быть пустым.');
-                    }
+                    const houseNumber = text?.trim() || '';
+                    session.houseNumber = houseNumber;
                     
-                    session.houseNumber = text;
-                    await db.saveAddress(chatId, session.city, session.street, session.houseNumber, 'dtek_only');
+                    await db.saveAddress(chatId, session.city, session.street, houseNumber, 'dtek_only');
+                    invalidateUserCache(chatId);
                     
-                    bot.sendMessage(chatId, `Адрес сохранен: ${session.city}, ${session.street}, ${session.houseNumber}\n📊 Режим: Только DTEK (проверка отключений)\n\n🔄 После подключения устройства режим автоматически переключится на полноценный мониторинг`);
+                    const addressText = houseNumber 
+                        ? `📍 Адрес сохранен:\n${session.city}, ${session.street}, ${houseNumber}`
+                        : `📍 Адрес сохранен:\n${session.city}, ${session.street} (вся улица)`;
+                    
+                    bot.sendMessage(chatId, `${addressText}\n\n⚡ /dtek - информация об отключениях\n🔌 Подключите устройство для автоматического мониторинга`);
                     updatePinnedMessage(chatId);
                     delete userSessions[chatId];
                     break;
@@ -453,25 +654,55 @@ bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
     
-    if (await shouldSkipChat(chatId)) return;
-    
-    if (data.startsWith('select_city_')) {
-        const index = parseInt(data.replace('select_city_', ''));
-        if (userSessions[chatId]?.citySuggestions?.[index]) {
-            const city = userSessions[chatId].citySuggestions[index].item;
-            userSessions[chatId] = { step: 'street', city: city };
-            bot.sendMessage(chatId, 'Введите название улицы.');
+    try {
+        // Выбор города из популярных
+        if (data.startsWith('city_')) {
+            const city = data.replace('city_', '');
+            
+            if (cities.includes(city)) {
+                userSessions[chatId] = { step: 'street', city: city };
+                bot.sendMessage(chatId, `✅ Город: ${city}\n\n🏠 Введите название улицы:`);
+            }
         }
-    } else if (data.startsWith('select_street_')) {
-        const index = parseInt(data.replace('select_street_', ''));
-        if (userSessions[chatId]?.streetSuggestions?.[index]) {
-            const street = userSessions[chatId].streetSuggestions[index].item;
-            userSessions[chatId].street = street;
-            userSessions[chatId].step = 'houseNumber';
-            bot.sendMessage(chatId, 'Введите номер дома.');
+        // Выбор города из предложенных
+        else if (data.startsWith('select_city_')) {
+            const index = parseInt(data.replace('select_city_', ''));
+            if (userSessions[chatId]?.citySuggestions?.[index]) {
+                const city = userSessions[chatId].citySuggestions[index].item;
+                userSessions[chatId] = { step: 'street', city: city };
+                bot.sendMessage(chatId, `✅ Город: ${city}\n\n🏠 Введите название улицы:`);
+            }
         }
+        // Выбор улицы из предложенных
+        else if (data.startsWith('select_street_')) {
+            const index = parseInt(data.replace('select_street_', ''));
+            if (userSessions[chatId]?.streetSuggestions?.[index]) {
+                const street = userSessions[chatId].streetSuggestions[index].item;
+                userSessions[chatId].street = street;
+                userSessions[chatId].step = 'houseNumber';
+                const keyboard = {
+                    inline_keyboard: [[{ text: '⏭ Пропустить (вся улица)', callback_data: 'skip_house' }]]
+                };
+                bot.sendMessage(chatId, `✅ Улица: ${street}\n\n🏘 Введите номер дома или пропустите для всей улицы:`, { reply_markup: keyboard });
+            }
+        }
+        // Пропустить номер дома
+        else if (data === 'skip_house') {
+            if (userSessions[chatId]?.step === 'houseNumber') {
+                const session = userSessions[chatId];
+                await db.saveAddress(chatId, session.city, session.street, '', 'dtek_only');
+                invalidateUserCache(chatId);
+                bot.sendMessage(chatId, `📍 Адрес сохранен:\n${session.city}, ${session.street} (вся улица)\n\n⚡ /dtek - информация об отключениях\n🔌 Подключите устройство для автоматического мониторинга`);
+                updatePinnedMessage(chatId);
+                delete userSessions[chatId];
+            }
+        }
+        
+        bot.answerCallbackQuery(query.id);
+    } catch (error) {
+        logger.error(`Ошибка callback для ${chatId}: ${error.message}`);
+        bot.answerCallbackQuery(query.id, { text: 'Ошибка обработки' });
     }
-    bot.answerCallbackQuery(query.id);
 });
 
 // Запуск сервера
@@ -482,6 +713,10 @@ const PORT = process.env.PORT || 5002;
         await db.initialize();
         logger.info('Google Sheets подключен');
         
+        // Инициализация кеша пользователей
+        await refreshUsersCache();
+        logger.info('Кеш пользователей инициализирован');
+        
         if (WEBHOOK_URL) {
             await bot.setWebHook(`${WEBHOOK_URL}/bot${TELEGRAM_TOKEN}`);
             logger.info(`Webhook установлен: ${WEBHOOK_URL}/bot${TELEGRAM_TOKEN}`);
@@ -489,11 +724,8 @@ const PORT = process.env.PORT || 5002;
         
         app.listen(PORT, () => logger.info(`Сервер запущен на порту ${PORT}`));
         
-        setInterval(checkLightsStatus, 60000);
-        logger.info('Внутренняя проверка света запущена (каждые 60 секунд)');
-        
-        setInterval(checkDtekOnlyStatus, 15 * 60 * 1000);
-        logger.info('DTEK-only проверка запущена (каждые 15 минут)');
+        setInterval(checkLightsStatus, LIGHTS_CHECK_INTERVAL_MS);
+        logger.info('Единая проверка состояния запущена (каждые 60 секунд)');
         
         setTimeout(() => {
             logger.info('🔄 Выполняем первоначальную проверку состояния...');
