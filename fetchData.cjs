@@ -1,15 +1,18 @@
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 const { DateTime, Settings } = require('luxon');
 Settings.defaultZone = 'Europe/Kyiv';
 
-const cache = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут
+const agentOpts = { keepAlive: true, maxSockets: 1000, keepAliveMsecs: 60_000 };
+const axiosInstance = axios.create({
+  timeout: 10000,
+  httpAgent: new http.Agent(agentOpts),
+  httpsAgent: new https.Agent(agentOpts),
+  validateStatus: s => s >= 200 && s < 500
+});
 
 const fetchData = async (city, street, houseNumber) => {
-  const key = `${city}-${street}-${houseNumber}`;
-  const cached = cache.get(key);
-  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL_MS) return cached.data;
-
   const headers = {
     'Accept': 'application/json, text/javascript, */*; q=0.01',
     'Accept-Encoding': 'gzip, deflate, br, zstd',
@@ -41,20 +44,17 @@ const fetchData = async (city, street, houseNumber) => {
     const now = DateTime.now();
     const updateFact = now.toFormat('dd.MM.yyyy HH:mm');
     
-    let response = await axios.post('https://www.dtek-oem.com.ua/ua/ajax', makeParams(updateFact).toString(), { headers });
+    let response = await axiosInstance.post('https://www.dtek-oem.com.ua/ua/ajax', makeParams(updateFact).toString(), { headers });
     let { result, data: responseData, updateTimestamp, showCurOutageParam, preset } = response.data || {};
 
     const presetUpdateFact = preset?.updateFact || preset?.update || response.data?.fact?.update;
     const missingHouse = !(responseData && Object.prototype.hasOwnProperty.call(responseData, houseNumber));
     if (result && missingHouse && presetUpdateFact && presetUpdateFact !== updateFact) {
-      response = await axios.post('https://www.dtek-oem.com.ua/ua/ajax', makeParams(presetUpdateFact).toString(), { headers });
+      response = await axiosInstance.post('https://www.dtek-oem.com.ua/ua/ajax', makeParams(presetUpdateFact).toString(), { headers });
       ({ result, data: responseData, updateTimestamp, showCurOutageParam } = response.data || {});
     }
 
-    if (!result) {
-      cache.set(key, { data: null, timestamp: Date.now() });
-      return null;
-    }
+    if (!result) return null;
 
     let inferredKey = null;
     const mapping = response.data?.preset?.data;
@@ -82,7 +82,6 @@ const fetchData = async (city, street, houseNumber) => {
       showTablePlan: !!response.data?.showTablePlan,
       showTableFact: !!response.data?.showTableFact
     };
-    cache.set(key, { data: resultData, timestamp: Date.now() });
     return resultData;
   } catch (error) {
     console.error('[DTEK] Ошибка:', error.message);
