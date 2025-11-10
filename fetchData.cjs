@@ -3,10 +3,61 @@ const axios = require('axios');
 const cache = new Map();
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут
 
+// Attempt to normalize street casing similar to how the site expects it
+function titleCaseStreet(street) {
+  try {
+    const preserve = new Set(['вул.', 'просп.', 'пров.', 'пл.', 'б-р', 'пр-т', 'пер.', 'шосе']);
+    return String(street)
+      .split(' ')
+      .map((w) => {
+        const wl = w.toLowerCase();
+        if (preserve.has(wl)) return w; // keep abbreviation as is
+        return w
+          .split('-')
+          .map(seg => (seg ? seg.charAt(0).toUpperCase() + seg.slice(1) : seg))
+          .join('-');
+      })
+      .join(' ');
+  } catch {
+    return street;
+  }
+}
+
+function parseNum(s) {
+  const m = String(s ?? '').match(/\d+/);
+  return m ? parseInt(m[0], 10) : NaN;
+}
+
+function hasHouseKey(obj, houseNumber) {
+  if (!obj) return false;
+  if (Object.prototype.hasOwnProperty.call(obj, houseNumber)) return true;
+  const inputNum = parseNum(houseNumber);
+  if (Number.isNaN(inputNum)) return false;
+  const keys = Object.keys(obj);
+  for (const k of keys) {
+    const kn = parseNum(k);
+    if (!Number.isNaN(kn) && kn === inputNum) return true;
+  }
+  return false;
+}
+
 const fetchData = async (city, street, houseNumber) => {
   const key = `${city}-${street}-${houseNumber}`;
   const cached = cache.get(key);
   if (cached && (Date.now() - cached.timestamp) < CACHE_TTL_MS) {
+    try {
+      const cd = cached.data;
+      const keys = cd?.data ? Object.keys(cd.data) : [];
+      const firstKeys = keys.slice(0, 5);
+      const sample = firstKeys.slice(0, 3).map(k => ({
+        key: k,
+        sub_type: cd?.data?.[k]?.sub_type,
+        start_date: cd?.data?.[k]?.start_date,
+        end_date: cd?.data?.[k]?.end_date,
+        sub_type_reason: cd?.data?.[k]?.sub_type_reason,
+      }));
+      console.log('[DTEK][fetchData] cache hit:', JSON.stringify({ city, street, houseNumber, keysCount: keys.length, firstKeys, sample, resolvedHomeKey: cd?.resolvedHomeKey, showCurOutageParam: !!cd?.showCurOutageParam, updateTimestamp: cd?.updateTimestamp }));
+    } catch {}
     return cached.data;
   }
 
@@ -49,10 +100,12 @@ const fetchData = async (city, street, houseNumber) => {
 
     let response = await axios.post(url, ufParams.toString(), { headers });
     let { result, data: responseData, updateTimestamp, showCurOutageParam, showCurSchedule, showTableSchedule, showTablePlan, showTableFact, preset } = response.data || {};
+    let usedUpdateFact = updateFact;
+    let usedStreetVariant = street;
 
     // If the current-time updateFact did not include our house key but server suggests a preset.updateFact, try again with that value
     const presetUpdateFact = preset?.updateFact || preset?.update || response.data?.fact?.update;
-    const missingRequestedHouse = !(responseData && Object.prototype.hasOwnProperty.call(responseData, houseNumber));
+    const missingRequestedHouse = !(responseData && hasHouseKey(responseData, houseNumber));
     if (result && missingRequestedHouse && presetUpdateFact && presetUpdateFact !== updateFact) {
       const ufParams2 = new URLSearchParams({
         'method': 'getHomeNum',
@@ -65,6 +118,57 @@ const fetchData = async (city, street, houseNumber) => {
       });
       response = await axios.post(url, ufParams2.toString(), { headers });
       ({ result, data: responseData, updateTimestamp, showCurOutageParam, showCurSchedule, showTableSchedule, showTablePlan, showTableFact } = response.data || {});
+      usedUpdateFact = presetUpdateFact;
+    }
+
+    // If house still missing (or listing houses), retry with a title-cased street variant (preserving common abbreviations like "вул.")
+    if (result && !(responseData && hasHouseKey(responseData, houseNumber))) {
+      const streetTC = titleCaseStreet(street);
+      if (streetTC && streetTC !== street) {
+        const ufParams3 = new URLSearchParams({
+          'method': 'getHomeNum',
+          'data[0][name]': 'city',
+          'data[0][value]': city,
+          'data[1][name]': 'street',
+          'data[1][value]': streetTC,
+          'data[2][name]': 'updateFact',
+          'data[2][value]': usedUpdateFact,
+        });
+        try {
+          const response3 = await axios.post(url, ufParams3.toString(), { headers });
+          const r3 = response3.data || {};
+          if (r3.result && r3.data) {
+            const currentCount = responseData ? Object.keys(responseData).length : 0;
+            const newCount = Object.keys(r3.data).length;
+            const adoptByKey = hasHouseKey(r3.data, houseNumber);
+            const adoptByCoverage = !houseNumber && newCount > currentCount;
+            if (adoptByKey || adoptByCoverage) {
+              response = response3;
+              ({ result, data: responseData, updateTimestamp, showCurOutageParam, showCurSchedule, showTableSchedule, showTablePlan, showTableFact } = response.data || {});
+              usedStreetVariant = streetTC;
+              try {
+                const keys = responseData ? Object.keys(responseData) : [];
+                const firstKeys = keys.slice(0, 5);
+                const sample = firstKeys.slice(0, 3).map(k => ({
+                  key: k,
+                  sub_type: responseData?.[k]?.sub_type,
+                  start_date: responseData?.[k]?.start_date,
+                  end_date: responseData?.[k]?.end_date,
+                  sub_type_reason: responseData?.[k]?.sub_type_reason,
+                }));
+                console.log('[DTEK][fetchData] retry with street variant succeeded:', JSON.stringify({ city, street, streetTC, houseNumber, usedUpdateFact, keysCount: keys.length, firstKeys, sample, adoptByCoverage }));
+              } catch {}
+            } else {
+              try {
+                const keys = r3.data ? Object.keys(r3.data) : [];
+                console.log('[DTEK][fetchData] retry with street variant did not include house:', JSON.stringify({ city, street, streetTC, houseNumber, usedUpdateFact, keysCount: keys.length }));
+              } catch {}
+            }
+          }
+        } catch (e) {
+          console.error('[DTEK][fetchData] retry with street variant failed:', e.message);
+        }
+      }
     }
 
 
@@ -94,6 +198,19 @@ const fetchData = async (city, street, houseNumber) => {
 
       const resolvedKeyFinal = inferredKey || null;
 
+      try {
+        const keys = responseData ? Object.keys(responseData) : [];
+        const firstKeys = keys.slice(0, 5);
+        const sample = firstKeys.slice(0, 3).map(k => ({
+          key: k,
+          sub_type: responseData?.[k]?.sub_type,
+          start_date: responseData?.[k]?.start_date,
+          end_date: responseData?.[k]?.end_date,
+          sub_type_reason: responseData?.[k]?.sub_type_reason,
+        }));
+        console.log('[DTEK][fetchData] fetch summary:', JSON.stringify({ city, street: usedStreetVariant, houseNumber, usedUpdateFact, result: !!result, keysCount: keys.length, firstKeys, sample, resolvedHomeKey: resolvedKeyFinal, showCurOutageParam: !!showCurOutageParam, updateTimestamp }));
+      } catch {}
+
       const resultData = {
         data: responseData,
         updateTimestamp,
@@ -107,6 +224,9 @@ const fetchData = async (city, street, houseNumber) => {
       cache.set(key, { data: resultData, timestamp: Date.now() });
       return resultData;
     } else {
+      try {
+        console.log('[DTEK][fetchData] empty result:', JSON.stringify({ city, street, houseNumber, usedUpdateFact }));
+      } catch {}
       cache.set(key, { data: null, timestamp: Date.now() });
       return null;
     }
@@ -115,6 +235,9 @@ const fetchData = async (city, street, houseNumber) => {
     if (error.response) {
       console.error('[DTEK] Error response body:', error.response.data);
     }
+    try {
+      console.error('[DTEK][fetchData] request failed for:', JSON.stringify({ city, street, houseNumber }));
+    } catch {}
     return null;
   }
 };

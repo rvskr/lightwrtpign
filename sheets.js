@@ -58,10 +58,10 @@ class SheetsDB {
 
                 await this.sheets.spreadsheets.values.update({
                     spreadsheetId: this.spreadsheetId,
-                    range: `${this.sheetName}!A1:K1`,
+                    range: `${this.sheetName}!A1:J1`,
                     valueInputOption: 'USER_ENTERED',
                     resource: {
-                        values: [['chat_id', 'last_ping_time', 'light_state', 'light_start_time', 'previous_duration', 'pinned_message_id', 'city', 'street', 'house_number', 'ignored', 'mode']]
+                        values: [['chat_id', 'last_ping_time', 'light_state', 'light_start_time', 'previous_duration', 'pinned_message_id', 'city', 'street', 'house_number', 'ignored']]
                     }
                 });
 
@@ -140,8 +140,7 @@ class SheetsDB {
             city: row[6] || '',
             street: row[7] || '',
             house_number: row[8] || '',
-            ignored: row[9] && (row[9] === 'TRUE' || row[9] === 'true' || row[9] === true),
-            mode: row[10] || 'full'
+            ignored: row[9] && (row[9] === 'TRUE' || row[9] === 'true' || row[9] === true)
         };
     }
 
@@ -243,7 +242,7 @@ class SheetsDB {
         }
     }
 
-    async saveAddress(chatId, city, street, houseNumber, mode = 'full') {
+    async saveAddress(chatId, city, street, houseNumber) {
         try {
             this.clearCache(chatId);
             this.clearAllCache();
@@ -252,9 +251,9 @@ class SheetsDB {
             if (row) {
                 await this.sheets.spreadsheets.values.update({
                     spreadsheetId: this.spreadsheetId,
-                    range: `${this.sheetName}!G${row}:K${row}`,
+                    range: `${this.sheetName}!G${row}:J${row}`,
                     valueInputOption: 'USER_ENTERED',
-                    resource: { values: [[city, street, houseNumber, 'FALSE', mode]] }
+                    resource: { values: [[city, street, houseNumber, 'FALSE']] }
                 });
                 this.logger.info(`Адрес для chat_id ${chatId} сохранен`);
             } else {
@@ -264,11 +263,11 @@ class SheetsDB {
                     `'${now.toFormat('dd.MM.yyyy HH:mm:ss')}`,
                     'FALSE',
                     `'${now.toFormat('dd.MM.yyyy HH:mm:ss')}`,
-                    '', '', city, street, houseNumber, 'FALSE', mode
+                    '', '', city, street, houseNumber, 'FALSE'
                 ]];
                 await this.sheets.spreadsheets.values.append({
                     spreadsheetId: this.spreadsheetId,
-                    range: `${this.sheetName}!A:K`,
+                    range: `${this.sheetName}!A:J`,
                     valueInputOption: 'USER_ENTERED',
                     resource: { values }
                 });
@@ -345,16 +344,6 @@ class SheetsDB {
         return result;
     }
 
-    async setMode(chatId, mode) {
-        const result = await this.updateField(chatId, 'K', mode);
-        if (result) this.logger.info(`Режим ${mode} установлен для chat_id ${chatId}`);
-        return result;
-    }
-
-    async getMode(chatId) {
-        const row = await this.getLightState(chatId);
-        return row?.mode || null;
-    }
 }
 
 module.exports = SheetsDB;
