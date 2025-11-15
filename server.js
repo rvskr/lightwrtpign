@@ -148,7 +148,28 @@ class Middleware {
 
 class AddressService {
     static async saveAndNotify(chatId, session) {
-        await db.saveAddress(chatId, session.city, session.street, session.houseNumber);
+        // Получаем данные из парсера для определения очереди
+        let queue = '';
+        try {
+            const streetToUse = Utils.canonicalizeStreet(session.city, session.street);
+            const result = await fetchData(session.city, streetToUse, session.houseNumber);
+            if (result?.data) {
+                const keys = Object.keys(result.data);
+                const houseKey = keys.find(k => k === session.houseNumber) || 
+                                keys.find(k => k.toLowerCase() === session.houseNumber.toLowerCase()) ||
+                                keys[0];
+                
+                if (houseKey && result.data[houseKey]?.sub_type_reason) {
+                    const reasons = result.data[houseKey].sub_type_reason;
+                    queue = Array.isArray(reasons) ? reasons[0] || '' : String(reasons || '');
+                    logger.info(`Определена очередь ${queue} для адреса ${session.city}, ${session.street}, ${session.houseNumber}`);
+                }
+            }
+        } catch (e) {
+            logger.error(`Ошибка определения очереди для ${chatId}: ${e.message}`);
+        }
+        
+        await db.saveAddress(chatId, session.city, session.street, session.houseNumber, queue);
         bot.sendMessage(chatId, Utils.getAddressSavedMessage(session.city, session.street, session.houseNumber));
         NotificationService.updatePinnedMessage(chatId);
         delete userSessions[chatId];
@@ -279,7 +300,7 @@ class AddressService {
 
 // DTEK сервис
 class DtekService {
-    static async fetchAndSummarize(city, street, house_number) {
+    static async fetchAndSummarize(city, street, house_number, queue = null) {
         try {
             const streetToUse = Utils.canonicalizeStreet(city, street);
             const result = await fetchData(city, streetToUse, house_number);
@@ -314,23 +335,62 @@ class DtekService {
             }
             const houseData = (keyToUse && data[keyToUse]) ? data[keyToUse] : {};
             
+            // Если нет данных по конкретному дому, пробуем найти по очереди
             if (!houseData.sub_type && !showCurOutageParam) {
+                // Если есть очередь, ищем другие адреса с такой же очередью
+                if (queue && queue.trim()) {
+                    try {
+                        const addressesByQueue = await db.getAddressesByQueue(queue);
+                        logger.info(`Поиск по очереди ${queue}: найдено ${addressesByQueue.length} адресов`);
+                        
+                        // Пробуем получить данные по другим адресам с той же очередью
+                        for (const addr of addressesByQueue) {
+                            if (addr.city === city && addr.street === street && addr.house_number === house_number) {
+                                continue; // Пропускаем текущий адрес
+                            }
+                            
+                            const queueResult = await fetchData(addr.city, addr.street, addr.house_number);
+                            if (queueResult?.data) {
+                                const queueKeys = Object.keys(queueResult.data);
+                                for (const qk of queueKeys) {
+                                    const qData = queueResult.data[qk];
+                                    if (qData?.sub_type || qData?.start_date || qData?.end_date) {
+                                        logger.info(`Найдены данные по очереди ${queue} для адреса ${addr.city}, ${addr.street}, ${addr.house_number}`);
+                                        return {
+                                            inferredOff: true,
+                                            message: `Обновлено: ${queueResult.updateTimestamp || updateTimestamp}\n\nАдрес: ${city}, ${street}, ${house_number}\nОчередь: ${queue}\n(Данные по аналогичному адресу: ${addr.city}, ${addr.street}, ${addr.house_number})\n\nТип: ${qData.sub_type || 'Не указано'}\nНачало: ${qData.start_date || 'Не указано'}\nОкончание: ${qData.end_date || 'Не указано'}\nТип причины: ${qData.sub_type_reason?.join(', ') || 'Не указано'}`,
+                                            updateTimestamp: queueResult.updateTimestamp || updateTimestamp
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        logger.error(`Ошибка поиска по очереди ${queue}: ${e.message}`);
+                    }
+                }
+                
                 return { inferredOff: false, message: `По адресу ${city}, ${street}, ${house_number} отключений нет. Обновлено: ${updateTimestamp}` };
             }
 
             if (!houseData.sub_type && showCurOutageParam) {
                 const all = Object.values(data || {});
-                const isActive = (x) => !!(x && (x.sub_type?.trim() || x.start_date?.trim() || x.end_date?.trim() || (Array.isArray(x?.sub_type_reason) && x.sub_type_reason.length > 0)));
-                const candidates = all.filter(isActive).length > 0 ? all.filter(isActive) : all;
+                const isActive = (x) => !!(x && (x.sub_type?.trim() || x.start_date?.trim() || x.end_date?.trim()));
+                const activeCandidates = all.filter(isActive);
+                
+                // Если нет ни одного дома с реальными данными об отключениях, значит отключений нет
+                if (activeCandidates.length === 0) {
+                    return { inferredOff: false, message: `По адресу ${city}, ${street}, ${house_number} отключений нет. Обновлено: ${updateTimestamp}` };
+                }
 
-                const reasons = [...new Set(candidates.flatMap(x => Array.isArray(x?.sub_type_reason) ? x.sub_type_reason : []).filter(Boolean))];
+                const reasons = [...new Set(activeCandidates.flatMap(x => Array.isArray(x?.sub_type_reason) ? x.sub_type_reason : []).filter(Boolean))];
                 const parseMaybe = (s) => {
                     if (!s || !s.trim()) return null;
                     const dt = DateTime.fromFormat(s.trim(), 'HH:mm dd.MM.yyyy');
                     return dt.isValid ? dt : null;
                 };
-                const starts = candidates.map(x => parseMaybe(x?.start_date)).filter(Boolean);
-                const ends = candidates.map(x => parseMaybe(x?.end_date)).filter(Boolean);
+                const starts = activeCandidates.map(x => parseMaybe(x?.start_date)).filter(Boolean);
+                const ends = activeCandidates.map(x => parseMaybe(x?.end_date)).filter(Boolean);
                 const minStart = starts.length ? starts.reduce((a,b) => a < b ? a : b) : null;
                 const maxEnd = ends.length ? ends.reduce((a,b) => a > b ? a : b) : null;
                 const startText = minStart ? minStart.toFormat('HH:mm dd.MM.yyyy') : 'Не указано';
@@ -360,8 +420,8 @@ class DtekService {
             return 'Адрес не настроен. Используйте /address для настройки.';
         }
 
-        const { city, street, house_number } = row;
-        const summary = await DtekService.fetchAndSummarize(city, street, house_number);
+        const { city, street, house_number, queue } = row;
+        const summary = await DtekService.fetchAndSummarize(city, street, house_number, queue);
         return summary.message;
     }
 }

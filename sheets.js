@@ -58,10 +58,10 @@ class SheetsDB {
 
                 await this.sheets.spreadsheets.values.update({
                     spreadsheetId: this.spreadsheetId,
-                    range: `${this.sheetName}!A1:J1`,
+                    range: `${this.sheetName}!A1:K1`,
                     valueInputOption: 'USER_ENTERED',
                     resource: {
-                        values: [['chat_id', 'last_ping_time', 'light_state', 'light_start_time', 'previous_duration', 'pinned_message_id', 'city', 'street', 'house_number', 'ignored']]
+                        values: [['chat_id', 'last_ping_time', 'light_state', 'light_start_time', 'previous_duration', 'pinned_message_id', 'city', 'street', 'house_number', 'ignored', 'queue']]
                     }
                 });
 
@@ -189,30 +189,39 @@ class SheetsDB {
     async getLightState(chatId) {
         try {
             const cached = this.getCached(chatId);
-            if (cached !== null) return cached;
+            if (cached) return cached;
 
             const response = await this.sheets.spreadsheets.values.get({
                 spreadsheetId: this.spreadsheetId,
                 range: `${this.sheetName}!A:K`,
             });
 
-            const rows = response.data.values;
-            if (!rows || rows.length <= 1) {
-                this.setCache(chatId, null);
-                return null;
-            }
+            const rows = response.data.values || [];
+            const dataRow = rows.find(row => row[0] == chatId);
 
-            const dataRow = rows.slice(1).find(row => row[0] === String(chatId));
             if (!dataRow) {
                 this.setCache(chatId, null);
                 return null;
             }
 
-            const result = this.parseRow(dataRow);
+            const result = {
+                chat_id: dataRow[0],
+                last_ping_time: dataRow[1] || '',
+                light_state: dataRow[2] === 'TRUE',
+                light_start_time: dataRow[3] || '',
+                previous_duration: dataRow[4] || '',
+                pinned_message_id: dataRow[5] || null,
+                city: dataRow[6] || '',
+                street: dataRow[7] || '',
+                house_number: dataRow[8] || '',
+                ignored: dataRow[9] === 'TRUE',
+                queue: dataRow[10] || ''
+            };
+
             this.setCache(chatId, result);
             return result;
         } catch (error) {
-            this.logger.error(`Ошибка получения состояния света: ${error.message}`);
+            this.logger.error(`Ошибка чтения данных из Google Sheets для chat_id ${chatId}: ${error.message}`);
             return null;
         }
     }
@@ -233,7 +242,19 @@ class SheetsDB {
                 return [];
             }
 
-            const result = rows.slice(1).map(row => this.parseRow(row));
+            const result = rows.slice(1).map(row => ({
+                chat_id: row[0],
+                last_ping_time: row[1] || '',
+                light_state: row[2] === 'TRUE',
+                light_start_time: row[3] || '',
+                previous_duration: row[4] || '',
+                pinned_message_id: row[5] || null,
+                city: row[6] || '',
+                street: row[7] || '',
+                house_number: row[8] || '',
+                ignored: row[9] === 'TRUE',
+                queue: row[10] || ''
+            }));
             this.setAllCache(result);
             return result;
         } catch (error) {
@@ -242,7 +263,7 @@ class SheetsDB {
         }
     }
 
-    async saveAddress(chatId, city, street, houseNumber) {
+    async saveAddress(chatId, city, street, houseNumber, queue = '') {
         try {
             this.clearCache(chatId);
             this.clearAllCache();
@@ -251,11 +272,11 @@ class SheetsDB {
             if (row) {
                 await this.sheets.spreadsheets.values.update({
                     spreadsheetId: this.spreadsheetId,
-                    range: `${this.sheetName}!G${row}:J${row}`,
+                    range: `${this.sheetName}!G${row}:K${row}`,
                     valueInputOption: 'USER_ENTERED',
-                    resource: { values: [[city, street, houseNumber, 'FALSE']] }
+                    resource: { values: [[city, street, houseNumber, 'FALSE', queue]] }
                 });
-                this.logger.info(`Адрес для chat_id ${chatId} сохранен`);
+                this.logger.info(`Адрес для chat_id ${chatId} сохранен с очередью ${queue}`);
             } else {
                 const now = DateTime.now();
                 const values = [[
@@ -263,15 +284,15 @@ class SheetsDB {
                     `'${now.toFormat('dd.MM.yyyy HH:mm:ss')}`,
                     'FALSE',
                     `'${now.toFormat('dd.MM.yyyy HH:mm:ss')}`,
-                    '', '', city, street, houseNumber, 'FALSE'
+                    '', '', city, street, houseNumber, 'FALSE', queue
                 ]];
                 await this.sheets.spreadsheets.values.append({
                     spreadsheetId: this.spreadsheetId,
-                    range: `${this.sheetName}!A:J`,
+                    range: `${this.sheetName}!A:K`,
                     valueInputOption: 'USER_ENTERED',
                     resource: { values }
                 });
-                this.logger.info(`Новая строка с адресом для chat_id ${chatId} создана`);
+                this.logger.info(`Новая строка с адресом для chat_id ${chatId} создана с очередью ${queue}`);
             }
         } catch (error) {
             this.logger.error(`Ошибка сохранения адреса: ${error.message}`);
@@ -342,6 +363,27 @@ class SheetsDB {
         const result = await this.updateField(chatId, 'F', messageId);
         if (result) this.logger.info(`Pinned message ID ${messageId} сохранен для chat_id ${chatId}`);
         return result;
+    }
+
+    async getAddressesByQueue(queue) {
+        try {
+            if (!queue || !queue.trim()) return [];
+            
+            const allStates = await this.getAllLightStates();
+            const filtered = allStates.filter(row => 
+                row.queue && 
+                row.queue.trim() === queue.trim() &&
+                row.city && 
+                row.street && 
+                row.house_number
+            );
+            
+            this.logger.info(`Найдено ${filtered.length} адресов с очередью ${queue}`);
+            return filtered;
+        } catch (error) {
+            this.logger.error(`Ошибка поиска адресов по очереди ${queue}: ${error.message}`);
+            return [];
+        }
     }
 
 }
